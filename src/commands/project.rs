@@ -49,7 +49,11 @@ pub fn run_add(config: &Config, git_url: &str, name: Option<&str>) -> Result<()>
         .clone_bare(git_url, &bare_dir)
         .with_context(|| format!("failed to clone '{}'", git_url))?;
 
-    // Set relative worktree paths
+    // Set relative worktree paths so the worktree's .git pointer resolves
+    // both on the host and inside the container that bind-mounts the project.
+    // Note: `git worktree add` is what actually auto-writes
+    // `extensions.relativeWorktrees = true` (which breaks libgit2/nix); we
+    // strip that in `run_branch` after each worktree add.
     config
         .git
         .set_config(&bare_dir, "worktree.useRelativePaths", "true")
@@ -145,6 +149,17 @@ pub fn run_branch(
         eprintln!("[branch] worktree already exists at {}", worktree_path.display());
     }
 
+    // `git worktree add` with useRelativePaths enabled bumps the bare repo's
+    // repositoryformatversion to 1 and writes `extensions.relativeWorktrees = true`.
+    // libgit2 (used by nix) rejects unknown extension names and refuses to open
+    // the worktree, breaking `nix develop` inside the sandbox. The relative
+    // gitdir paths still resolve correctly without the extension marker, so we
+    // strip it after each worktree add.
+    config
+        .git
+        .unset_config(&bare_dir, "extensions.relativeWorktrees")
+        .context("failed to unset extensions.relativeWorktrees on bare repo")?;
+
     // 2. Read flake files from git (for image decisions)
     let flake_nix = config
         .git
@@ -181,19 +196,26 @@ pub fn run_branch(
             container_path: "/workspace".to_string(),
         }];
         if claude_dir.exists() {
+            // Mounted at sandbox's home: the container exec drops to the
+            // `sandbox` user before launching claude (claude refuses to run
+            // with `--dangerously-skip-permissions` under uid 0).
             mounts.push(Mount {
                 host_path: claude_dir.to_string_lossy().to_string(),
-                container_path: "/root/.claude".to_string(),
+                container_path: "/home/sandbox/.claude".to_string(),
             });
         }
 
+        // Entrypoint script (baked into the image) forks `nix-daemon` before
+        // executing the args, so `nix develop` from the sandbox user can reach
+        // the daemon socket at `/nix/var/nix/daemon-socket/socket`. Without
+        // this, sandbox has no way to mutate the nix store.
         config
             .container
             .create_container(
                 &container_nm,
                 &project_image,
                 &mounts,
-                &["sleep", "infinity"],
+                &["/usr/local/bin/nixsand-init", "sleep", "infinity"],
             )
             .with_context(|| format!("failed to create container '{}'", container_nm))?;
 
@@ -215,6 +237,24 @@ pub fn run_branch(
     } else {
         eprintln!("[branch] container '{}' is already running", container_nm);
     }
+
+    // Chown the bind mounts sandbox needs to write to. `/nix/var/nix` is
+    // *not* in this list anymore: the container runs Nix in multi-user mode
+    // and the nix-daemon (started by the entrypoint script) owns all store
+    // mutations on behalf of the sandbox user — chowning the daemon's state
+    // dir would break it.
+    //
+    // /workspace and /home/sandbox/.claude are bind mounts. Apple's virtiofs
+    // usually ignores chown on bind mounts (host owner shows through), so
+    // these are best-effort — claude reads via 0644/0755 perms, and writes
+    // go to the host as the host user.
+    config
+        .container
+        .exec(
+            &container_nm,
+            "chown -R 1000:1000 /workspace /home/sandbox/.claude 2>/dev/null || true",
+        )
+        .with_context(|| format!("failed to chown sandbox dirs in '{}'", container_nm))?;
 
     // 6. Register branch in DB
     config
@@ -275,13 +315,21 @@ pub fn run_attach(config: &Config, project: &str, branch: &str) -> Result<()> {
             .with_context(|| format!("failed to start container '{}'", container_nm))?;
     }
 
-    // Build the exec command
+    // Build the exec command.
+    //
+    // Run as the `sandbox` user (uid 1000) — claude refuses
+    // `--dangerously-skip-permissions` under uid 0. The container's entrypoint
+    // has already chowned the bind mounts so sandbox can write to them.
+    // claude lives in the system nix profile, which is on the default PATH.
     let exec_cmd = format!(
         "cd {} && nix develop -c claude --dangerously-skip-permissions",
         worktree_in_container
     );
+    // Apple's `container exec --user <name>` hangs silently when given a
+    // username string; only numeric UIDs work. The `sandbox` user is uid 1000
+    // (see the base Dockerfile in src/image.rs).
     let tmux_cmd = format!(
-        "container exec -it {} sh -lc '{}'",
+        "container exec -it --user 1000 -e HOME=/home/sandbox {} sh -lc '{}'",
         container_nm, exec_cmd
     );
 

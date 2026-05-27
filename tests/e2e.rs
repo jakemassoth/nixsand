@@ -616,3 +616,246 @@ fn project_attach_creates_and_reattaches_tmux_session() {
         second_stderr
     );
 }
+
+// ---------------------------------------------------------------------------
+// Sandbox functional test: `nix develop` must work inside the container
+// ---------------------------------------------------------------------------
+
+/// Regression test for the libgit2/`extensions.relativeWorktrees` issue.
+///
+/// When `worktree.useRelativePaths` is enabled on the bare repo, modern git
+/// (2.48+) also writes `extensions.relativeWorktrees = true`. Nix uses libgit2,
+/// which rejects unknown extensions and refuses to open the worktree — so
+/// every `nix develop` inside the sandbox would die immediately with a
+/// `libgit2 error code = 6` error. `project add` unsets the extension to keep
+/// libgit2 happy; this test asserts that `nix develop` actually works inside
+/// the running container, which is the user-facing guarantee that matters.
+#[test]
+#[ignore = "heavy: builds real container images; requires macOS aarch64 + container + tmux"]
+fn nix_develop_works_inside_sandbox_container() {
+    let env = TestEnv::new();
+    env.init();
+
+    let repo = SampleRepo::new();
+    let name = unique_name();
+
+    env.cmd()
+        .args(["project", "add", &repo.url(), &name])
+        .assert()
+        .success();
+
+    let container_nm = format!("nixsand-{}-main", name);
+    let _container_cleanup = ContainerCleanup::new([container_nm.clone()]);
+    let _image_cleanup = ImageCleanup::new([format!("nixsand-{}", name)]);
+
+    env.cmd()
+        .args(["project", "branch", &name, "main"])
+        .assert()
+        .success();
+
+    // Run the same shape of command `nixsand project attach` runs (minus
+    // claude itself, which would block waiting for input). If `nix develop`
+    // can't open the worktree as a git repo, this fails fast with the
+    // libgit2 extension-name error.
+    let output = Command::new("container")
+        .args([
+            "exec",
+            &container_nm,
+            "sh",
+            "-c",
+            "cd /workspace/worktrees/main && nix develop -c echo NIX_DEVELOP_OK",
+        ])
+        .output()
+        .expect("container exec failed to spawn");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        output.status.success() && stdout.contains("NIX_DEVELOP_OK"),
+        "`nix develop` inside the sandbox should succeed.\nstatus: {}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        stdout,
+        stderr,
+    );
+}
+
+/// Regression test for the "container runs as root" issue.
+///
+/// `claude --dangerously-skip-permissions` (the flag `project attach` launches
+/// claude with) refuses to run under uid 0 with the message
+/// "--dangerously-skip-permissions cannot be used with root/sudo privileges".
+/// When that happens, the tmux pane's command exits in under a second and the
+/// session dies (tmux's default `remain-on-exit off`), which is what the user
+/// experiences as `[exited]` immediately after attaching.
+///
+/// This test invokes the real `nixsand project attach`, waits a few seconds,
+/// and asserts the tmux session is still alive — meaning claude is actually
+/// running inside the sandbox.
+#[test]
+#[ignore = "heavy: builds real container images; requires macOS aarch64 + container + tmux"]
+fn claude_can_run_with_skip_permissions_inside_sandbox() {
+    let env = TestEnv::new();
+    env.init();
+
+    let repo = SampleRepo::new();
+    let name = unique_name();
+
+    env.cmd()
+        .args(["project", "add", &repo.url(), &name])
+        .assert()
+        .success();
+
+    let container_nm = format!("nixsand-{}-main", name);
+    let session_nm = format!("nixsand_{}_main", name);
+    let _container_cleanup = ContainerCleanup::new([container_nm.clone()]);
+    let _image_cleanup = ImageCleanup::new([format!("nixsand-{}", name)]);
+    let _session_cleanup = TmuxSessionCleanup::new([session_nm.clone()]);
+
+    env.cmd()
+        .args(["project", "branch", &name, "main"])
+        .assert()
+        .success();
+
+    // Run attach. The detached tmux session and the claude process inside it
+    // are real even though the host `tmux attach-session` call fails due to no TTY.
+    let _ = env
+        .cmd()
+        .args(["project", "attach", &name, "main"])
+        .output()
+        .expect("nixsand attach failed to spawn");
+
+    // Give claude a few seconds to either start or exit fast with an error.
+    std::thread::sleep(std::time::Duration::from_secs(4));
+
+    // Best-effort pane capture for diagnostics in the failure message.
+    // If the pane has already died, this returns nothing.
+    let pane = Command::new("tmux")
+        .args(["capture-pane", "-p", "-t", &session_nm])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+        .unwrap_or_default();
+
+    let has_session = Command::new("tmux")
+        .args(["has-session", "-t", &session_nm])
+        .output()
+        .expect("tmux has-session failed to spawn")
+        .status
+        .success();
+
+    assert!(
+        !pane.contains("cannot be used with root"),
+        "claude refused to start because the sandbox container runs as root.\npane:\n{}",
+        pane,
+    );
+    assert!(
+        has_session,
+        "tmux session '{}' died within seconds of attach — claude exited immediately.\nlast captured pane:\n{}",
+        session_nm, pane,
+    );
+}
+
+/// End-to-end check of the user-facing attach flow: after `nixsand project
+/// attach`, claude must have actually rendered its welcome screen in the
+/// tmux pane. The earlier `claude_can_run_…` test only verifies that the
+/// pane's command stays alive — but claude can stay alive without drawing
+/// anything (no TTY, missing env, stuck initialization), which manifests
+/// to the user as a blank terminal after attaching.
+#[test]
+#[ignore = "heavy: builds real container images; requires macOS aarch64 + container + tmux"]
+fn attach_renders_claude_welcome_screen() {
+    let env = TestEnv::new();
+    env.init();
+
+    let repo = SampleRepo::new();
+    let name = unique_name();
+
+    env.cmd()
+        .args(["project", "add", &repo.url(), &name])
+        .assert()
+        .success();
+
+    let container_nm = format!("nixsand-{}-main", name);
+    let session_nm = format!("nixsand_{}_main", name);
+    let _container_cleanup = ContainerCleanup::new([container_nm.clone()]);
+    let _image_cleanup = ImageCleanup::new([format!("nixsand-{}", name)]);
+    let _session_cleanup = TmuxSessionCleanup::new([session_nm.clone()]);
+
+    env.cmd()
+        .args(["project", "branch", &name, "main"])
+        .assert()
+        .success();
+
+    // Run nixsand attach. The host-side `tmux attach-session` fails because
+    // the test process has no controlling TTY, but the detached tmux session
+    // and its claude process are real.
+    let attach = env
+        .cmd()
+        .args(["project", "attach", &name, "main"])
+        .output()
+        .expect("nixsand attach failed to spawn");
+    let attach_stderr = String::from_utf8_lossy(&attach.stderr).into_owned();
+
+    // Give claude time to start, initialize, and draw its welcome screen.
+    // `nix develop` is cached after the branch step, so this is mostly
+    // claude's own startup time.
+    std::thread::sleep(std::time::Duration::from_secs(15));
+
+    // Gather diagnostics so a failure message tells us what state we're in.
+    let tmux_ls = Command::new("tmux")
+        .args(["ls"])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+        .unwrap_or_default();
+    let pane_list = Command::new("tmux")
+        .args(["list-panes", "-t", &session_nm, "-F",
+               "pid=#{pane_pid} cmd=#{pane_current_command} dead=#{pane_dead} size=#{pane_width}x#{pane_height}"])
+        .output()
+        .map(|o| {
+            format!("{}{}",
+                String::from_utf8_lossy(&o.stdout),
+                String::from_utf8_lossy(&o.stderr))
+        })
+        .unwrap_or_default();
+    let container_procs = Command::new("container")
+        .args(["exec", &container_nm, "sh", "-c",
+               "ls /proc | grep '^[0-9]' | while read p; do c=$(tr '\\0' ' ' < /proc/$p/cmdline 2>/dev/null); [ -n \"$c\" ] && echo \"$p: $c\"; done"])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+        .unwrap_or_default();
+    // Ownership of dirs sandbox needs to read/write — bind-mount filesystems
+    // sometimes ignore chown.
+    let ownership = Command::new("container")
+        .args(["exec", &container_nm, "sh", "-c",
+               "stat -c '%u:%g %n' /workspace /home/sandbox/.claude /nix/var/nix /nix/var/nix/db 2>&1"])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+        .unwrap_or_default();
+    // Probe: run nix develop directly as uid 1000 and capture stderr.
+    let probe = Command::new("container")
+        .args(["exec", "--user", "1000", "-e", "HOME=/home/sandbox", &container_nm,
+               "sh", "-lc",
+               "cd /workspace/worktrees/main && nix develop -c true 2>&1; echo exit=$?"])
+        .output()
+        .map(|o| format!("{}{}",
+            String::from_utf8_lossy(&o.stdout),
+            String::from_utf8_lossy(&o.stderr)))
+        .unwrap_or_default();
+    let pane = Command::new("tmux")
+        .args(["capture-pane", "-p", "-t", &session_nm])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+        .unwrap_or_default();
+
+    assert!(
+        pane.contains("Claude"),
+        "\n--- nixsand attach stderr ---\n{}\n\
+         --- tmux ls ---\n{}\n\
+         --- list-panes -t {} ---\n{}\n\
+         --- container processes ---\n{}\n\
+         --- container ownership ---\n{}\n\
+         --- direct probe: nix develop as uid 1000 ---\n{}\n\
+         --- captured pane (len={}) ---\n{}\n--- end ---",
+        attach_stderr, tmux_ls, session_nm, pane_list, container_procs, ownership, probe, pane.len(), pane,
+    );
+}

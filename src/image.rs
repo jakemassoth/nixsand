@@ -10,8 +10,54 @@ use crate::store::Store;
 // Dockerfile templates
 // ---------------------------------------------------------------------------
 
-const BASE_DOCKERFILE: &str = r#"FROM ghcr.io/nixos/nix:latest
-RUN NIXPKGS_ALLOW_UNFREE=1 nix profile install nixpkgs#claude-code --extra-experimental-features "nix-command flakes" --impure
+// Notes:
+//  - Base is plain Ubuntu + the Determinate Systems Nix installer (multi-user
+//    mode). Nix is installed into `/nix/var/nix/profiles/default` and the
+//    daemon socket lives at `/nix/var/nix/daemon-socket/socket`.
+//  - claude-code is installed into the *system* (default) profile so the
+//    non-root `sandbox` user can find `claude` on PATH (we set PATH below).
+//  - We add a `sandbox` (uid 1000) user via `useradd` because
+//    `claude --dangerously-skip-permissions` refuses to run under uid 0.
+//  - `/usr/local/bin/nixsand-init` is the container entrypoint: it forks
+//    `nix-daemon` (Determinate's multi-user install needs the daemon running
+//    to serve store mutations) and then execs the command passed by the
+//    create_container call (currently `sleep infinity`). Daemon stdout/stderr
+//    go to /var/log/nix-daemon.log so it's debuggable but doesn't spam the
+//    container's main log.
+//  - The Determinate installer uses `linux --init none --no-confirm` because
+//    Apple containers do not run systemd and the install must be
+//    non-interactive.
+const BASE_DOCKERFILE: &str = r#"FROM ubuntu:24.04
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      curl ca-certificates xz-utils git sudo \
+ && rm -rf /var/lib/apt/lists/*
+RUN curl --proto '=https' --tlsv1.2 -sSf -L https://install.determinate.systems/nix \
+    | sh -s -- install linux --init none --no-confirm
+ENV PATH=/nix/var/nix/profiles/default/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+RUN printf '#!/bin/sh\nnix-daemon --daemon >/var/log/nix-daemon.log 2>&1 &\nexec "$@"\n' \
+      > /usr/local/bin/nixsand-init \
+ && chmod +x /usr/local/bin/nixsand-init
+RUN nix-daemon --daemon >/var/log/nix-daemon.log 2>&1 & \
+    for i in 1 2 3 4 5 6 7 8 9 10; do \
+      [ -S /nix/var/nix/daemon-socket/socket ] && break; sleep 1; \
+    done; \
+    NIXPKGS_ALLOW_UNFREE=1 nix profile install \
+      --profile /nix/var/nix/profiles/default \
+      nixpkgs#claude-code --impure
+RUN userdel -r ubuntu 2>/dev/null || true \
+ && useradd -m -u 1000 -s /bin/bash sandbox
+# Workspaces are bind-mounted from the host and Apple's virtiofs reports them
+# as owned by root (0:0) regardless of the host UID. libgit2 — which Nix uses
+# to evaluate `git+file://` flake inputs — refuses to open repos owned by a
+# different user than the caller (`error code = 7`, "is not owned by current
+# user"). Adding a wildcard `safe.directory` to the system gitconfig tells
+# libgit2 (and git) to trust any directory, which is what we want here:
+# every path inside this sandbox is project code the user asked us to run.
+RUN install -d /etc \
+ && printf '[safe]\n\tdirectory = *\n' > /etc/gitconfig
+ENTRYPOINT ["/usr/local/bin/nixsand-init"]
 CMD ["sleep", "infinity"]
 "#;
 
@@ -22,9 +68,11 @@ fn project_dockerfile(flake_nix: &[u8], flake_lock: &[u8]) -> String {
         r#"FROM {}
 COPY flake.nix /project-src/flake.nix
 COPY flake.lock /project-src/flake.lock
-RUN echo 'extra-experimental-features = nix-command flakes' >> /etc/nix/nix.conf \
- && (cd /project-src && nix develop --command true)
-CMD ["sleep", "infinity"]
+RUN nix-daemon --daemon >/var/log/nix-daemon.log 2>&1 & \
+    for i in 1 2 3 4 5 6 7 8 9 10; do \
+      [ -S /nix/var/nix/daemon-socket/socket ] && break; sleep 1; \
+    done; \
+    cd /project-src && nix develop --command true
 "#,
         base_image_tag()
     )

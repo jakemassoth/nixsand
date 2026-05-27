@@ -125,6 +125,18 @@ impl ContainerBackend for RealContainerBackend {
         }
         Ok(())
     }
+
+    fn exec(&self, name: &str, command: &str) -> Result<()> {
+        let output = Command::new("container")
+            .args(["exec", name, "sh", "-c", command])
+            .output()
+            .context("failed to run 'container exec'")?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            bail!("container exec failed for '{}': {}", name, stderr.trim());
+        }
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -157,6 +169,24 @@ impl GitBackend for RealGitBackend {
             bail!("git config {} {} failed", key, value);
         }
         Ok(())
+    }
+
+    fn unset_config(&self, repo: &Path, key: &str) -> Result<()> {
+        // `git config --unset` exits 5 when the key is missing — treat that as success.
+        let output = Command::new("git")
+            .args(["-C"])
+            .arg(repo)
+            .args(["config", "--unset", key])
+            .output()
+            .context("failed to run 'git config --unset'")?;
+        if output.status.success() {
+            return Ok(());
+        }
+        if output.status.code() == Some(5) {
+            return Ok(());
+        }
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("git config --unset {} failed: {}", key, stderr.trim());
     }
 
     fn add_worktree(

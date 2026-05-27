@@ -29,12 +29,17 @@ pub trait ContainerBackend: Send + Sync {
     fn remove_container(&self, name: &str) -> Result<()>;
     /// Run an interactive command inside a container (for attach).
     fn exec_interactive(&self, name: &str, command: &str) -> Result<()>;
+    /// Run a command inside a container non-interactively and wait for it.
+    /// Used for synchronous setup steps (e.g. chowning bind mounts).
+    fn exec(&self, name: &str, command: &str) -> Result<()>;
 }
 
 /// Trait abstracting git operations.
 pub trait GitBackend: Send + Sync {
     fn clone_bare(&self, url: &str, dest: &Path) -> Result<()>;
     fn set_config(&self, repo: &Path, key: &str, value: &str) -> Result<()>;
+    /// Remove a config key. Succeeds if the key is already absent.
+    fn unset_config(&self, repo: &Path, key: &str) -> Result<()>;
     fn add_worktree(
         &self,
         bare_repo: &Path,

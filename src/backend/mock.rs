@@ -127,6 +127,11 @@ impl ContainerBackend for MockContainerBackend {
         self.record(format!("exec_interactive:{}:{}", name, command));
         Ok(())
     }
+
+    fn exec(&self, name: &str, command: &str) -> Result<()> {
+        self.record(format!("exec:{}:{}", name, command));
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -173,6 +178,11 @@ impl GitBackend for MockGitBackend {
 
     fn set_config(&self, repo: &Path, key: &str, value: &str) -> Result<()> {
         self.record(format!("set_config:{}:{}:{}", repo.display(), key, value));
+        Ok(())
+    }
+
+    fn unset_config(&self, repo: &Path, key: &str) -> Result<()> {
+        self.record(format!("unset_config:{}:{}", repo.display(), key));
         Ok(())
     }
 
