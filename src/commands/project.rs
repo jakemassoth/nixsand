@@ -1,0 +1,308 @@
+use anyhow::{anyhow, bail, Context, Result};
+
+use crate::backend::Mount;
+use crate::config::Config;
+use crate::guard::RollbackGuard;
+use crate::image::{ensure_base_image, ensure_project_image};
+use crate::names::{
+    container_name, name_from_url, project_image_tag, sanitize_branch, validate_project_name,
+    zmx_session_name,
+};
+
+// ---------------------------------------------------------------------------
+// project add
+// ---------------------------------------------------------------------------
+
+pub fn run_add(config: &Config, git_url: &str, name: Option<&str>) -> Result<()> {
+    // Derive project name from URL if not provided
+    let project_name = match name {
+        Some(n) => n.to_string(),
+        None => name_from_url(git_url),
+    };
+
+    validate_project_name(&project_name)?;
+
+    // Check for duplicate
+    if config.store.project_exists(&project_name)? {
+        bail!(
+            "project '{}' already exists; choose a different name or remove the existing project",
+            project_name
+        );
+    }
+
+    // Create project directory structure
+    let _project_dir = config.project_dir(&project_name);
+    let bare_dir = config.bare_repo_dir(&project_name);
+    let worktrees_dir = config.worktrees_dir(&project_name);
+
+    std::fs::create_dir_all(&worktrees_dir).with_context(|| {
+        format!(
+            "failed to create project directory at {}",
+            worktrees_dir.display()
+        )
+    })?;
+
+    // Bare clone
+    eprintln!("[add] cloning {} into {}...", git_url, bare_dir.display());
+    config
+        .git
+        .clone_bare(git_url, &bare_dir)
+        .with_context(|| format!("failed to clone '{}'", git_url))?;
+
+    // Set relative worktree paths
+    config
+        .git
+        .set_config(&bare_dir, "worktree.useRelativePaths", "true")
+        .context("failed to configure worktree.useRelativePaths")?;
+
+    // Register in DB
+    config
+        .store
+        .add_project(&project_name, git_url)
+        .with_context(|| format!("failed to register project '{}'", project_name))?;
+
+    println!("project '{}' added ({})", project_name, git_url);
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// project list
+// ---------------------------------------------------------------------------
+
+pub fn run_list(config: &Config) -> Result<()> {
+    let projects = config.store.list_projects()?;
+    if projects.is_empty() {
+        println!("no projects registered; run 'nixsand project add <git-url>' to add one");
+    } else {
+        for (name, url) in &projects {
+            println!("{}\t{}", name, url);
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// project branch
+// ---------------------------------------------------------------------------
+
+pub fn run_branch(
+    config: &Config,
+    project: &str,
+    branch: &str,
+    base: Option<&str>,
+) -> Result<()> {
+    // Validate project exists
+    if !config.store.project_exists(project)? {
+        bail!(
+            "project '{}' not found; run 'nixsand project add <git-url>' first",
+            project
+        );
+    }
+
+    let sanitized = sanitize_branch(branch);
+    let bare_dir = config.bare_repo_dir(project);
+    let worktree_path = config.worktree_dir(project, branch);
+    let container_nm = container_name(project, &sanitized);
+
+    // Determine base
+    let base_branch = match base {
+        Some(b) => b.to_string(),
+        None => config
+            .git
+            .default_branch(&bare_dir)
+            .context("failed to determine default branch")?,
+    };
+
+    eprintln!(
+        "[branch] provisioning branch '{}' from '{}' for project '{}'",
+        branch, base_branch, project
+    );
+
+    // Rollback guard
+    let mut guard = RollbackGuard::new();
+
+    // 1. Create worktree (if it doesn't already exist)
+    if !worktree_path.exists() {
+        config
+            .git
+            .add_worktree(&bare_dir, &worktree_path, branch, &base_branch)
+            .with_context(|| {
+                format!(
+                    "failed to create worktree for branch '{}' at {}",
+                    branch,
+                    worktree_path.display()
+                )
+            })?;
+
+        let wt = worktree_path.clone();
+        guard.push(move || {
+            eprintln!("[rollback] removing worktree at {}", wt.display());
+            if let Err(e) = std::fs::remove_dir_all(&wt) {
+                eprintln!("[rollback] failed to remove worktree: {}", e);
+            }
+        });
+    } else {
+        eprintln!("[branch] worktree already exists at {}", worktree_path.display());
+    }
+
+    // 2. Read flake files from git (for image decisions)
+    let flake_nix = config
+        .git
+        .read_file(&bare_dir, "flake.nix")
+        .unwrap_or_default();
+    let flake_lock = config
+        .git
+        .read_file(&bare_dir, "flake.lock")
+        .unwrap_or_default();
+
+    // 3. Ensure base image
+    ensure_base_image(config.container.as_ref()).context("failed to ensure base image")?;
+
+    // 4. Ensure per-project image
+    ensure_project_image(
+        project,
+        config.container.as_ref(),
+        &config.store,
+        &flake_nix,
+        &flake_lock,
+    )
+    .context("failed to ensure per-project image")?;
+
+    // 5. Create and start container (if not already running)
+    let project_image = project_image_tag(project);
+    let project_dir = config.project_dir(project);
+    let claude_dir = dirs::home_dir()
+        .map(|h| h.join(".claude"))
+        .unwrap_or_else(|| std::path::PathBuf::from("/root/.claude"));
+
+    if !config.container.container_exists(&container_nm)? {
+        let mut mounts = vec![Mount {
+            host_path: project_dir.to_string_lossy().to_string(),
+            container_path: "/workspace".to_string(),
+        }];
+        if claude_dir.exists() {
+            mounts.push(Mount {
+                host_path: claude_dir.to_string_lossy().to_string(),
+                container_path: "/root/.claude".to_string(),
+            });
+        }
+
+        config
+            .container
+            .create_container(
+                &container_nm,
+                &project_image,
+                &mounts,
+                &["sleep", "infinity"],
+            )
+            .with_context(|| format!("failed to create container '{}'", container_nm))?;
+
+        let cn = container_nm.clone();
+        // Note: the guard closure can't hold a reference to config.container, so
+        // we record the container name and emit a warning on rollback.
+        guard.push(move || {
+            eprintln!("[rollback] note: container '{}' may need manual removal", cn);
+        });
+    } else {
+        eprintln!("[branch] container '{}' already exists", container_nm);
+    }
+
+    if !config.container.container_running(&container_nm)? {
+        config
+            .container
+            .start_container(&container_nm)
+            .with_context(|| format!("failed to start container '{}'", container_nm))?;
+    } else {
+        eprintln!("[branch] container '{}' is already running", container_nm);
+    }
+
+    // 6. Register branch in DB
+    config
+        .store
+        .add_branch(project, branch, &sanitized)
+        .with_context(|| format!("failed to register branch '{}' in store", branch))?;
+
+    let proj = project.to_string();
+    let br = branch.to_string();
+    guard.push(move || {
+        eprintln!("[rollback] note: branch registration for '{}/{}' may need manual cleanup", proj, br);
+    });
+
+    // All steps succeeded — commit the guard
+    guard.commit();
+
+    println!(
+        "branch '{}' ready: container '{}' is running",
+        branch, container_nm
+    );
+    println!("run 'nixsand project attach {} {}' to attach", project, branch);
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// project attach
+// ---------------------------------------------------------------------------
+
+pub fn run_attach(config: &Config, project: &str, branch: &str) -> Result<()> {
+    // Validate project + branch exist in the registry
+    if !config.store.project_exists(project)? {
+        bail!(
+            "project '{}' not found; run 'nixsand project add <git-url>' first",
+            project
+        );
+    }
+    let sanitized = config
+        .store
+        .lookup_branch(project, branch)?
+        .ok_or_else(|| {
+            anyhow!(
+                "branch '{}' not found for project '{}'; run 'nixsand project branch {} {}' first",
+                branch, project, project, branch
+            )
+        })?;
+
+    let container_nm = container_name(project, &sanitized);
+    let session = zmx_session_name(project, &sanitized);
+    let worktree_in_container = format!("/workspace/worktrees/{}", branch);
+
+    // Start container if stopped
+    if !config.container.container_running(&container_nm)? {
+        eprintln!("[attach] container '{}' is stopped, starting...", container_nm);
+        config
+            .container
+            .start_container(&container_nm)
+            .with_context(|| format!("failed to start container '{}'", container_nm))?;
+    }
+
+    // Build the exec command
+    let exec_cmd = format!(
+        "cd {} && nix develop -c claude --dangerously-skip-permissions",
+        worktree_in_container
+    );
+    let tmux_cmd = format!(
+        "container exec -it {} sh -lc '{}'",
+        container_nm, exec_cmd
+    );
+
+    // Create tmux session if it doesn't exist; otherwise reattach
+    if config.zmx.session_exists(&session)? {
+        eprintln!("[attach] reattaching to existing session '{}'", session);
+        config
+            .zmx
+            .attach_session(&session)
+            .with_context(|| format!("failed to attach to tmux session '{}'", session))?;
+    } else {
+        eprintln!("[attach] creating new tmux session '{}'", session);
+        config
+            .zmx
+            .new_session(&session, &tmux_cmd)
+            .with_context(|| format!("failed to create tmux session '{}'", session))?;
+        config
+            .zmx
+            .attach_session(&session)
+            .with_context(|| format!("failed to attach to tmux session '{}'", session))?;
+    }
+
+    Ok(())
+}

@@ -24,6 +24,7 @@
           buildInputs = [
             rustToolchain
             pkgs.cargo-watch
+            pkgs.tmux
           ];
 
           RUST_SRC_PATH = "${rustToolchain}/lib/rustlib/src/rust/library";
