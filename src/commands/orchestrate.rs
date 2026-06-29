@@ -1,0 +1,373 @@
+use anyhow::{anyhow, bail, Context, Result};
+
+use crate::config::Config;
+use crate::guard::RollbackGuard;
+use crate::names::{nixsand_session, sanitize_branch, window_name};
+use crate::store::TaskRow;
+
+/// Default number of pane lines `peek` returns.
+const PEEK_LINES: usize = 40;
+
+/// Wrap a string in single quotes for safe inclusion in a `sh -lc` command,
+/// escaping any embedded single quotes.
+fn shell_single_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// Resolve a registered task, returning a clear error if it doesn't exist.
+fn require_task(config: &Config, project: &str, branch: &str) -> Result<TaskRow> {
+    if !config.store.project_exists(project)? {
+        bail!("project '{project}' not found; run 'nixsand project add <git-url>' first");
+    }
+    config.store.lookup_task(project, branch)?.ok_or_else(|| {
+        anyhow!(
+            "no task for '{project}/{branch}'; run 'nixsand spawn {project} {branch}' first"
+        )
+    })
+}
+
+// ---------------------------------------------------------------------------
+// spawn
+// ---------------------------------------------------------------------------
+
+pub fn run_spawn(
+    config: &Config,
+    project: &str,
+    branch: &str,
+    base: Option<&str>,
+    agent: &str,
+    prompt: Option<&str>,
+) -> Result<()> {
+    if !config.store.project_exists(project)? {
+        bail!("project '{project}' not found; run 'nixsand project add <git-url>' first");
+    }
+
+    let sanitized = sanitize_branch(branch);
+    let session = nixsand_session();
+    let window = window_name(project, &sanitized);
+    let bare_dir = config.bare_repo_dir(project);
+    let worktree_path = config.worktree_dir(project, branch);
+
+    // Refuse to clobber a task that's already running in a live window.
+    config.zmx.ensure_session(session)?;
+    if config.zmx.window_exists(session, &window)? {
+        bail!(
+            "a window for '{project}/{branch}' already exists; use 'nixsand send/peek {project} {branch}' or 'nixsand kill {project} {branch}' first"
+        );
+    }
+
+    let mut guard = RollbackGuard::new();
+
+    // 1. Create the worktree if it doesn't already exist.
+    if worktree_path.exists() {
+        eprintln!("[spawn] reusing worktree at {}", worktree_path.display());
+    } else {
+        let base_branch = match base {
+            Some(b) => b.to_string(),
+            None => config
+                .git
+                .default_branch(&bare_dir)
+                .context("failed to determine default branch")?,
+        };
+        config
+            .git
+            .add_worktree(&bare_dir, &worktree_path, branch, &base_branch)
+            .with_context(|| {
+                format!(
+                    "failed to create worktree for branch '{}' at {}",
+                    branch,
+                    worktree_path.display()
+                )
+            })?;
+
+        let wt = worktree_path.clone();
+        guard.push(move || {
+            eprintln!("[rollback] removing worktree at {}", wt.display());
+            if let Err(e) = std::fs::remove_dir_all(&wt) {
+                eprintln!("[rollback] failed to remove worktree: {e}");
+            }
+        });
+
+        // `git worktree add` with useRelativePaths enabled writes
+        // `extensions.relativeWorktrees = true`, which some libgit2 consumers
+        // reject. The relative gitdir paths resolve fine without the marker.
+        config
+            .git
+            .unset_config(&bare_dir, "extensions.relativeWorktrees")
+            .context("failed to unset extensions.relativeWorktrees on bare repo")?;
+    }
+
+    // 2. Launch the agent in a fresh tmux window rooted at the worktree.
+    let command = match prompt {
+        Some(p) => format!("{agent} {}", shell_single_quote(p)),
+        None => agent.to_string(),
+    };
+    config
+        .zmx
+        .new_window(session, &window, &worktree_path, &command)
+        .with_context(|| format!("failed to create tmux window '{session}:{window}'"))?;
+
+    // 3. Register the task.
+    config
+        .store
+        .register_task(project, branch, &sanitized, &window, agent)
+        .with_context(|| format!("failed to register task '{project}/{branch}'"))?;
+
+    guard.commit();
+
+    println!("spawned '{project}/{branch}' → agent '{agent}' in window '{window}'");
+    println!("  peek:   nixsand peek {project} {branch}");
+    println!("  steer:  nixsand send {project} {branch} \"<instruction>\"");
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// send
+// ---------------------------------------------------------------------------
+
+pub fn run_send(config: &Config, project: &str, branch: &str, text: &str) -> Result<()> {
+    let task = require_task(config, project, branch)?;
+    config
+        .zmx
+        .send_keys(nixsand_session(), &task.window, text)
+        .with_context(|| format!("failed to send keys to '{project}/{branch}'"))?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// peek
+// ---------------------------------------------------------------------------
+
+pub fn run_peek(config: &Config, project: &str, branch: &str, lines: Option<usize>) -> Result<()> {
+    let task = require_task(config, project, branch)?;
+    let pane = config
+        .zmx
+        .capture_pane(nixsand_session(), &task.window, Some(lines.unwrap_or(PEEK_LINES)))
+        .with_context(|| format!("failed to capture pane for '{project}/{branch}'"))?;
+    print!("{pane}");
+    if !pane.ends_with('\n') {
+        println!();
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// status
+// ---------------------------------------------------------------------------
+
+pub fn run_status(config: &Config) -> Result<()> {
+    let tasks = config.store.list_tasks()?;
+    if tasks.is_empty() {
+        println!("no active tasks; run 'nixsand spawn <project> <branch>' to start one");
+        return Ok(());
+    }
+
+    let session = nixsand_session();
+    let windows = config.zmx.list_windows(session).unwrap_or_default();
+
+    println!("{:<28} {:<10} {:<12} LAST LINE", "TASK", "AGENT", "STATE");
+    for task in &tasks {
+        let info = windows.iter().find(|w| w.name == task.window);
+        let state = match info {
+            Some(w) if w.dead => "dead",
+            Some(_) => "running",
+            None => "gone",
+        };
+        let last_line = if matches!(state, "running") {
+            config
+                .zmx
+                .capture_pane(session, &task.window, Some(5))
+                .ok()
+                .and_then(|p| {
+                    p.lines()
+                        .rev()
+                        .find(|l| !l.trim().is_empty())
+                        .map(str::to_string)
+                })
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
+        let label = format!("{}/{}", task.project, task.branch);
+        println!("{label:<28} {:<10} {state:<12} {last_line}", task.agent);
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// kill
+// ---------------------------------------------------------------------------
+
+pub fn run_kill(config: &Config, project: &str, branch: &str, rm_worktree: bool) -> Result<()> {
+    let task = require_task(config, project, branch)?;
+    let session = nixsand_session();
+
+    config
+        .zmx
+        .kill_window(session, &task.window)
+        .with_context(|| format!("failed to kill window for '{project}/{branch}'"))?;
+
+    if rm_worktree {
+        let bare_dir = config.bare_repo_dir(project);
+        let worktree_path = config.worktree_dir(project, branch);
+        config
+            .git
+            .remove_worktree(&bare_dir, &worktree_path)
+            .with_context(|| format!("failed to remove worktree for '{project}/{branch}'"))?;
+    }
+
+    config
+        .store
+        .remove_task(project, branch)
+        .with_context(|| format!("failed to deregister task '{project}/{branch}'"))?;
+
+    if rm_worktree {
+        println!("killed '{project}/{branch}' and removed its worktree");
+    } else {
+        println!("killed '{project}/{branch}' (worktree kept; re-spawn to resume)");
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// attach
+// ---------------------------------------------------------------------------
+
+pub fn run_attach(config: &Config, project: Option<&str>, branch: Option<&str>) -> Result<()> {
+    let session = nixsand_session();
+    if !config.zmx.session_exists(session)? {
+        bail!("no nixsand session yet; spawn a task first with 'nixsand spawn <project> <branch>'");
+    }
+
+    let window = match (project, branch) {
+        (Some(p), Some(b)) => Some(require_task(config, p, b)?.window),
+        _ => None,
+    };
+
+    config
+        .zmx
+        .attach(session, window.as_deref())
+        .context("failed to attach to nixsand session")?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backend::mock::{MockGitBackend, MockZmxBackend};
+    use crate::store::Store;
+    use tempfile::TempDir;
+
+    /// A Config backed by mocks + an in-memory store, with one project already
+    /// registered. The mocks are `Arc`-backed and `Clone`, so the returned
+    /// handles share state with the copies inside `config` — inspect calls
+    /// through them. Keep `_tmp` alive for the duration of the test.
+    struct Harness {
+        config: Config,
+        zmx: MockZmxBackend,
+        git: MockGitBackend,
+        _tmp: TempDir,
+    }
+
+    fn harness(zmx: MockZmxBackend) -> Harness {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open_in_memory().unwrap();
+        store.add_project("proj", "https://example.com/proj.git").unwrap();
+        let git = MockGitBackend::new();
+        let config = Config {
+            home: tmp.path().to_path_buf(),
+            store,
+            git: Box::new(git.clone()),
+            zmx: Box::new(zmx.clone()),
+        };
+        Harness { config, zmx, git, _tmp: tmp }
+    }
+
+    #[test]
+    fn shell_single_quote_escapes_quotes() {
+        assert_eq!(shell_single_quote("hi"), "'hi'");
+        assert_eq!(shell_single_quote("a'b"), "'a'\\''b'");
+    }
+
+    #[test]
+    fn spawn_creates_window_and_registers_task() {
+        let h = harness(MockZmxBackend::new());
+        run_spawn(&h.config, "proj", "feature/x", None, "claude", Some("do it")).unwrap();
+
+        // Task is registered with the derived window name.
+        let task = h.config.store.lookup_task("proj", "feature/x").unwrap().unwrap();
+        assert_eq!(task.window, "proj-feature-x");
+        assert_eq!(task.agent, "claude");
+
+        // The window was created with the prompt appended as a quoted arg.
+        let calls = h.zmx.recorded_calls();
+        assert!(
+            calls.iter().any(|c| c.starts_with("new_window:nixsand:proj-feature-x:")
+                && c.ends_with("claude 'do it'")),
+            "calls: {calls:?}"
+        );
+    }
+
+    #[test]
+    fn spawn_refuses_duplicate_window() {
+        let h = harness(MockZmxBackend::new());
+        run_spawn(&h.config, "proj", "x", None, "claude", None).unwrap();
+        let err = run_spawn(&h.config, "proj", "x", None, "claude", None).unwrap_err();
+        assert!(err.to_string().contains("already exists"), "{err}");
+    }
+
+    #[test]
+    fn spawn_unknown_project_errors() {
+        let h = harness(MockZmxBackend::new());
+        let err = run_spawn(&h.config, "nope", "x", None, "claude", None).unwrap_err();
+        assert!(err.to_string().contains("not found"), "{err}");
+    }
+
+    #[test]
+    fn send_targets_the_task_window() {
+        let h = harness(MockZmxBackend::new());
+        run_spawn(&h.config, "proj", "x", None, "claude", None).unwrap();
+        run_send(&h.config, "proj", "x", "run tests").unwrap();
+        let calls = h.zmx.recorded_calls();
+        assert!(
+            calls.contains(&"send_keys:nixsand:proj-x:run tests".to_string()),
+            "calls: {calls:?}"
+        );
+    }
+
+    #[test]
+    fn send_unknown_task_errors() {
+        let h = harness(MockZmxBackend::new());
+        let err = run_send(&h.config, "proj", "ghost", "hi").unwrap_err();
+        assert!(err.to_string().contains("no task"), "{err}");
+    }
+
+    #[test]
+    fn peek_returns_pane_content() {
+        let zmx = MockZmxBackend::new().with_pane("nixsand", "proj-x", "hello from agent\n");
+        let h = harness(zmx);
+        run_spawn(&h.config, "proj", "x", None, "claude", None).unwrap();
+        run_peek(&h.config, "proj", "x", Some(10)).unwrap();
+        let calls = h.zmx.recorded_calls();
+        assert!(calls.iter().any(|c| c == "capture_pane:nixsand:proj-x:10"), "calls: {calls:?}");
+    }
+
+    #[test]
+    fn kill_removes_window_and_task() {
+        let h = harness(MockZmxBackend::new());
+        run_spawn(&h.config, "proj", "x", None, "claude", None).unwrap();
+        run_kill(&h.config, "proj", "x", false).unwrap();
+        assert!(h.config.store.lookup_task("proj", "x").unwrap().is_none());
+        assert!(h.zmx.recorded_calls().contains(&"kill_window:nixsand:proj-x".to_string()));
+        // Without --rm-worktree, the worktree is not removed.
+        assert!(!h.git.recorded_calls().iter().any(|c| c.starts_with("remove_worktree")));
+    }
+
+    #[test]
+    fn kill_with_rm_worktree_removes_worktree() {
+        let h = harness(MockZmxBackend::new());
+        run_spawn(&h.config, "proj", "x", None, "claude", None).unwrap();
+        run_kill(&h.config, "proj", "x", true).unwrap();
+        assert!(h.git.recorded_calls().iter().any(|c| c.starts_with("remove_worktree")));
+    }
+}

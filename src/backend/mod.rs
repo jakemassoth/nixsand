@@ -4,36 +4,6 @@ use anyhow::Result;
 pub mod real;
 pub mod mock;
 
-/// A bind mount specification.
-#[derive(Debug, Clone)]
-pub struct Mount {
-    pub host_path: String,
-    pub container_path: String,
-}
-
-/// Trait abstracting container operations.
-#[allow(dead_code)]
-pub trait ContainerBackend: Send + Sync {
-    fn image_exists(&self, tag: &str) -> Result<bool>;
-    fn build_image(&self, tag: &str, context_dir: &Path) -> Result<()>;
-    fn container_exists(&self, name: &str) -> Result<bool>;
-    fn container_running(&self, name: &str) -> Result<bool>;
-    fn create_container(
-        &self,
-        name: &str,
-        image: &str,
-        mounts: &[Mount],
-        entrypoint: &[&str],
-    ) -> Result<()>;
-    fn start_container(&self, name: &str) -> Result<()>;
-    fn remove_container(&self, name: &str) -> Result<()>;
-    /// Run an interactive command inside a container (for attach).
-    fn exec_interactive(&self, name: &str, command: &str) -> Result<()>;
-    /// Run a command inside a container non-interactively and wait for it.
-    /// Used for synchronous setup steps (e.g. chowning bind mounts).
-    fn exec(&self, name: &str, command: &str) -> Result<()>;
-}
-
 /// Trait abstracting git operations.
 pub trait GitBackend: Send + Sync {
     fn clone_bare(&self, url: &str, dest: &Path) -> Result<()>;
@@ -47,14 +17,38 @@ pub trait GitBackend: Send + Sync {
         branch: &str,
         base: &str,
     ) -> Result<()>;
+    /// Remove a worktree registration (and prune stale metadata).
+    fn remove_worktree(&self, bare_repo: &Path, worktree_path: &Path) -> Result<()>;
     fn default_branch(&self, bare_repo: &Path) -> Result<String>;
-    /// Read a file from the repository's working tree (via git show).
-    fn read_file(&self, repo: &Path, path: &str) -> Result<Vec<u8>>;
+}
+
+/// Liveness/identity info for a single tmux window.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WindowInfo {
+    pub name: String,
+    pub active: bool,
+    pub dead: bool,
 }
 
 /// Trait abstracting tmux terminal multiplexer operations.
+///
+/// All windows live in a single session (see `names::nixsand_session`). Tasks
+/// are addressed as `<session>:<window>`. The orchestrator drives windows via
+/// `send_keys`/`capture_pane` without being attached; the human attaches
+/// separately to watch.
 pub trait ZmxBackend: Send + Sync {
     fn session_exists(&self, session: &str) -> Result<bool>;
-    fn new_session(&self, session: &str, command: &str) -> Result<()>;
-    fn attach_session(&self, session: &str) -> Result<()>;
+    /// Create the session (detached) if it does not already exist.
+    fn ensure_session(&self, session: &str) -> Result<()>;
+    /// Create a new window running `command` with working directory `cwd`.
+    fn new_window(&self, session: &str, window: &str, cwd: &Path, command: &str) -> Result<()>;
+    fn window_exists(&self, session: &str, window: &str) -> Result<bool>;
+    /// Send a single line of text followed by Enter into a window.
+    fn send_keys(&self, session: &str, window: &str, text: &str) -> Result<()>;
+    /// Capture the visible pane of a window. `lines` limits to the last N lines.
+    fn capture_pane(&self, session: &str, window: &str, lines: Option<usize>) -> Result<String>;
+    fn list_windows(&self, session: &str) -> Result<Vec<WindowInfo>>;
+    fn kill_window(&self, session: &str, window: &str) -> Result<()>;
+    /// Attach to the session; if `window` is given, select it first.
+    fn attach(&self, session: &str, window: Option<&str>) -> Result<()>;
 }

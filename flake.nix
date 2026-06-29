@@ -29,7 +29,7 @@
       in
       {
         packages = {
-          # nix build
+          # nix build  /  nix run . -- <args>
           default = naersk'.buildPackage { src = ./.; };
 
           # nix build .#check  — cargo check (type check without codegen)
@@ -54,14 +54,21 @@
         };
 
         # nix run .#e2e [-- <test-name>]  — runs the heavy e2e suite outside
-        # the nix sandbox. Requires macOS aarch64 with `container`, `tmux`, and
-        # `git` available on PATH (not provided by nix — the suite shells out
-        # to Apple's `container` CLI which lives outside nixpkgs).
+        # the nix sandbox. Requires `git` and `tmux` on PATH; drives real git
+        # worktrees and a real tmux session (no containers, no macOS
+        # requirement).
+        # nix run . -- <args>  — run THIS checkout's nixsand. The orchestrator
+        # uses this so each branch runs its own build.
+        apps.default = {
+          type = "app";
+          program = "${self.packages.${system}.default}/bin/nixsand";
+        };
+
         apps.e2e = {
           type = "app";
           program = toString (pkgs.writeShellScript "nixsand-e2e" ''
             set -euo pipefail
-            for bin in container tmux git; do
+            for bin in git tmux; do
               if ! command -v "$bin" >/dev/null 2>&1; then
                 echo "error: '$bin' not found in PATH; e2e tests require it" >&2
                 exit 1

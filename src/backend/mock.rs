@@ -4,135 +4,9 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-use anyhow::{bail, Result};
+use anyhow::Result;
 
-use super::{ContainerBackend, GitBackend, Mount, ZmxBackend};
-
-// ---------------------------------------------------------------------------
-// Recording mock for ContainerBackend
-// ---------------------------------------------------------------------------
-
-/// A recording mock for `ContainerBackend`.
-/// Stores calls as strings (e.g. "build_image:nixsand-base") and returns
-/// pre-configured results.
-#[derive(Clone, Default)]
-pub struct MockContainerBackend {
-    pub calls: Arc<Mutex<Vec<String>>>,
-    /// images that "exist" — checked by `image_exists`
-    pub existing_images: Arc<Mutex<Vec<String>>>,
-    /// containers that "exist"
-    pub existing_containers: Arc<Mutex<Vec<String>>>,
-    /// containers that are "running"
-    pub running_containers: Arc<Mutex<Vec<String>>>,
-    /// If set, `build_image` will return this error for the given tag
-    pub build_errors: Arc<Mutex<HashMap<String, String>>>,
-}
-
-impl MockContainerBackend {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn with_existing_images(images: &[&str]) -> Self {
-        let m = Self::new();
-        let mut lock = m.existing_images.lock().unwrap();
-        for img in images {
-            lock.push(img.to_string());
-        }
-        drop(lock);
-        m
-    }
-
-    pub fn recorded_calls(&self) -> Vec<String> {
-        self.calls.lock().unwrap().clone()
-    }
-
-    fn record(&self, call: String) {
-        self.calls.lock().unwrap().push(call);
-    }
-}
-
-impl ContainerBackend for MockContainerBackend {
-    fn image_exists(&self, tag: &str) -> Result<bool> {
-        self.record(format!("image_exists:{tag}"));
-        let images = self.existing_images.lock().unwrap();
-        Ok(images.contains(&tag.to_string()))
-    }
-
-    fn build_image(&self, tag: &str, _context_dir: &Path) -> Result<()> {
-        self.record(format!("build_image:{tag}"));
-        let errors = self.build_errors.lock().unwrap();
-        if let Some(err) = errors.get(tag) {
-            bail!("{err}");
-        }
-        // Add to existing images on success
-        drop(errors);
-        self.existing_images
-            .lock()
-            .unwrap()
-            .push(tag.to_string());
-        Ok(())
-    }
-
-    fn container_exists(&self, name: &str) -> Result<bool> {
-        self.record(format!("container_exists:{name}"));
-        let containers = self.existing_containers.lock().unwrap();
-        Ok(containers.contains(&name.to_string()))
-    }
-
-    fn container_running(&self, name: &str) -> Result<bool> {
-        self.record(format!("container_running:{name}"));
-        let running = self.running_containers.lock().unwrap();
-        Ok(running.contains(&name.to_string()))
-    }
-
-    fn create_container(
-        &self,
-        name: &str,
-        image: &str,
-        _mounts: &[Mount],
-        _entrypoint: &[&str],
-    ) -> Result<()> {
-        self.record(format!("create_container:{name}:{image}"));
-        self.existing_containers
-            .lock()
-            .unwrap()
-            .push(name.to_string());
-        Ok(())
-    }
-
-    fn start_container(&self, name: &str) -> Result<()> {
-        self.record(format!("start_container:{name}"));
-        self.running_containers
-            .lock()
-            .unwrap()
-            .push(name.to_string());
-        Ok(())
-    }
-
-    fn remove_container(&self, name: &str) -> Result<()> {
-        self.record(format!("remove_container:{name}"));
-        self.existing_containers
-            .lock()
-            .unwrap()
-            .retain(|c| c != name);
-        self.running_containers
-            .lock()
-            .unwrap()
-            .retain(|c| c != name);
-        Ok(())
-    }
-
-    fn exec_interactive(&self, name: &str, command: &str) -> Result<()> {
-        self.record(format!("exec_interactive:{name}:{command}"));
-        Ok(())
-    }
-
-    fn exec(&self, name: &str, command: &str) -> Result<()> {
-        self.record(format!("exec:{name}:{command}"));
-        Ok(())
-    }
-}
+use super::{GitBackend, WindowInfo, ZmxBackend};
 
 // ---------------------------------------------------------------------------
 // Recording mock for GitBackend
@@ -141,8 +15,6 @@ impl ContainerBackend for MockContainerBackend {
 #[derive(Clone, Default)]
 pub struct MockGitBackend {
     pub calls: Arc<Mutex<Vec<String>>>,
-    /// Content to return for `read_file` requests, keyed by "`repo_path:file_path`"
-    pub file_contents: Arc<Mutex<HashMap<String, Vec<u8>>>>,
     pub default_branch_response: Arc<Mutex<String>>,
 }
 
@@ -151,14 +23,6 @@ impl MockGitBackend {
         let m = Self::default();
         *m.default_branch_response.lock().unwrap() = "main".to_string();
         m
-    }
-
-    pub fn with_file(self, file_path: &str, content: &[u8]) -> Self {
-        self.file_contents
-            .lock()
-            .unwrap()
-            .insert(file_path.to_string(), content.to_vec());
-        self
     }
 
     pub fn recorded_calls(&self) -> Vec<String> {
@@ -203,15 +67,18 @@ impl GitBackend for MockGitBackend {
         Ok(())
     }
 
+    fn remove_worktree(&self, bare_repo: &Path, worktree_path: &Path) -> Result<()> {
+        self.record(format!(
+            "remove_worktree:{}:{}",
+            bare_repo.display(),
+            worktree_path.display()
+        ));
+        Ok(())
+    }
+
     fn default_branch(&self, bare_repo: &Path) -> Result<String> {
         self.record(format!("default_branch:{}", bare_repo.display()));
         Ok(self.default_branch_response.lock().unwrap().clone())
-    }
-
-    fn read_file(&self, _repo: &Path, path: &str) -> Result<Vec<u8>> {
-        self.record(format!("read_file:{path}"));
-        let contents = self.file_contents.lock().unwrap();
-        Ok(contents.get(path).cloned().unwrap_or_default())
     }
 }
 
@@ -223,6 +90,11 @@ impl GitBackend for MockGitBackend {
 pub struct MockZmxBackend {
     pub calls: Arc<Mutex<Vec<String>>>,
     pub existing_sessions: Arc<Mutex<Vec<String>>>,
+    /// In-memory windows per session, so orchestration logic can be tested
+    /// without a real tmux. Keyed by session; value is the ordered window list.
+    pub windows: Arc<Mutex<HashMap<String, Vec<WindowInfo>>>>,
+    /// Canned pane content keyed by "`session:window`".
+    pub pane_contents: Arc<Mutex<HashMap<String, String>>>,
 }
 
 impl MockZmxBackend {
@@ -234,6 +106,14 @@ impl MockZmxBackend {
         self.calls.lock().unwrap().clone()
     }
 
+    pub fn with_pane(self, session: &str, window: &str, content: &str) -> Self {
+        self.pane_contents
+            .lock()
+            .unwrap()
+            .insert(format!("{session}:{window}"), content.to_string());
+        self
+    }
+
     fn record(&self, call: String) {
         self.calls.lock().unwrap().push(call);
     }
@@ -242,21 +122,97 @@ impl MockZmxBackend {
 impl ZmxBackend for MockZmxBackend {
     fn session_exists(&self, session: &str) -> Result<bool> {
         self.record(format!("session_exists:{session}"));
-        let sessions = self.existing_sessions.lock().unwrap();
-        Ok(sessions.contains(&session.to_string()))
+        Ok(self.existing_sessions.lock().unwrap().contains(&session.to_string()))
     }
 
-    fn new_session(&self, session: &str, command: &str) -> Result<()> {
-        self.record(format!("new_session:{session}:{command}"));
-        self.existing_sessions
-            .lock()
-            .unwrap()
-            .push(session.to_string());
+    fn ensure_session(&self, session: &str) -> Result<()> {
+        self.record(format!("ensure_session:{session}"));
+        let mut sessions = self.existing_sessions.lock().unwrap();
+        if !sessions.contains(&session.to_string()) {
+            sessions.push(session.to_string());
+            self.windows
+                .lock()
+                .unwrap()
+                .entry(session.to_string())
+                .or_default();
+        }
         Ok(())
     }
 
-    fn attach_session(&self, session: &str) -> Result<()> {
-        self.record(format!("attach_session:{session}"));
+    fn new_window(&self, session: &str, window: &str, cwd: &Path, command: &str) -> Result<()> {
+        self.record(format!(
+            "new_window:{}:{}:{}:{}",
+            session,
+            window,
+            cwd.display(),
+            command
+        ));
+        self.windows
+            .lock()
+            .unwrap()
+            .entry(session.to_string())
+            .or_default()
+            .push(WindowInfo {
+                name: window.to_string(),
+                active: true,
+                dead: false,
+            });
+        Ok(())
+    }
+
+    fn window_exists(&self, session: &str, window: &str) -> Result<bool> {
+        self.record(format!("window_exists:{session}:{window}"));
+        Ok(self
+            .windows
+            .lock()
+            .unwrap()
+            .get(session)
+            .is_some_and(|ws| ws.iter().any(|w| w.name == window)))
+    }
+
+    fn send_keys(&self, session: &str, window: &str, text: &str) -> Result<()> {
+        self.record(format!("send_keys:{session}:{window}:{text}"));
+        Ok(())
+    }
+
+    fn capture_pane(&self, session: &str, window: &str, lines: Option<usize>) -> Result<String> {
+        self.record(format!(
+            "capture_pane:{session}:{window}:{}",
+            lines.map_or_else(|| "all".to_string(), |n| n.to_string())
+        ));
+        Ok(self
+            .pane_contents
+            .lock()
+            .unwrap()
+            .get(&format!("{session}:{window}"))
+            .cloned()
+            .unwrap_or_default())
+    }
+
+    fn list_windows(&self, session: &str) -> Result<Vec<WindowInfo>> {
+        self.record(format!("list_windows:{session}"));
+        Ok(self
+            .windows
+            .lock()
+            .unwrap()
+            .get(session)
+            .cloned()
+            .unwrap_or_default())
+    }
+
+    fn kill_window(&self, session: &str, window: &str) -> Result<()> {
+        self.record(format!("kill_window:{session}:{window}"));
+        if let Some(ws) = self.windows.lock().unwrap().get_mut(session) {
+            ws.retain(|w| w.name != window);
+        }
+        Ok(())
+    }
+
+    fn attach(&self, session: &str, window: Option<&str>) -> Result<()> {
+        self.record(format!(
+            "attach:{session}:{}",
+            window.unwrap_or("-")
+        ));
         Ok(())
     }
 }

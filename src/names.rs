@@ -81,28 +81,18 @@ pub fn sanitize_branch(branch: &str) -> String {
     result
 }
 
-/// Derive the container name from project + branch.
-pub fn container_name(project: &str, sanitized_branch: &str) -> String {
-    format!("nixsand-{project}-{sanitized_branch}")
+/// The single tmux session that holds every task window.
+pub fn nixsand_session() -> &'static str {
+    "nixsand"
 }
 
-/// Derive the tmux session name from project + branch.
+/// Derive the tmux window name for a task from project + sanitized branch.
 ///
-/// Uses `_` as the separator rather than `.` because tmux parses `.` as
-/// session/window/pane target syntax in `-t` arguments, which would break
-/// `has-session` and `attach-session` for any name containing dots.
-pub fn zmx_session_name(project: &str, sanitized_branch: &str) -> String {
-    format!("nixsand_{project}_{sanitized_branch}")
-}
-
-/// The base image tag.
-pub fn base_image_tag() -> &'static str {
-    "nixsand-base"
-}
-
-/// The per-project image tag.
-pub fn project_image_tag(project: &str) -> String {
-    format!("nixsand-{project}")
+/// Avoids `.` and `:` because tmux parses them as window/pane and
+/// session/window separators in `-t` target arguments. `sanitize_branch`
+/// already strips `.`/`:`, so a `-` join is target-safe.
+pub fn window_name(project: &str, sanitized_branch: &str) -> String {
+    format!("{project}-{sanitized_branch}")
 }
 
 #[cfg(test)]
@@ -139,24 +129,18 @@ mod tests {
     }
 
     #[test]
-    fn container_name_derivation() {
+    fn window_name_derivation() {
         assert_eq!(
-            container_name("myproject", "feature-foo"),
-            "nixsand-myproject-feature-foo"
+            window_name("myproject", "feature-foo"),
+            "myproject-feature-foo"
         );
     }
 
     #[test]
-    fn zmx_session_name_derivation() {
-        assert_eq!(
-            zmx_session_name("myproject", "feature-foo"),
-            "nixsand_myproject_feature-foo"
-        );
-    }
-
-    #[test]
-    fn image_tags() {
-        assert_eq!(base_image_tag(), "nixsand-base");
-        assert_eq!(project_image_tag("myproject"), "nixsand-myproject");
+    fn window_name_is_target_safe() {
+        // sanitize_branch + window_name must never produce tmux target
+        // metacharacters (`.` pane, `:` window).
+        let w = window_name("proj", &sanitize_branch("feature/x.y:z"));
+        assert!(!w.contains('.') && !w.contains(':'), "got {w}");
     }
 }

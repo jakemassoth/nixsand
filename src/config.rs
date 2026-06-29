@@ -1,23 +1,22 @@
 use std::path::PathBuf;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 
-use crate::backend::real::{check_binary, RealContainerBackend, RealGitBackend, RealZmxBackend};
-use crate::backend::{ContainerBackend, GitBackend, ZmxBackend};
+use crate::backend::real::{check_binary, RealGitBackend, RealZmxBackend};
+use crate::backend::{GitBackend, ZmxBackend};
 use crate::store::Store;
 
 /// Runtime configuration: home directory + backend handles.
 pub struct Config {
     pub home: PathBuf,
     pub store: Store,
-    pub container: Box<dyn ContainerBackend>,
     pub git: Box<dyn GitBackend>,
     pub zmx: Box<dyn ZmxBackend>,
 }
 
 impl Config {
     /// Build the runtime config from environment / defaults.
-    /// This validates the platform and opens the store.
+    /// This opens the store and wires up the real backends.
     pub fn load() -> Result<Self> {
         let home = resolve_home()?;
         let db_path = home.join("nixsand.db");
@@ -25,7 +24,6 @@ impl Config {
         Ok(Self {
             home,
             store,
-            container: Box::new(RealContainerBackend),
             git: Box::new(RealGitBackend),
             zmx: Box::new(RealZmxBackend),
         })
@@ -74,22 +72,9 @@ pub fn resolve_home() -> Result<PathBuf> {
     Ok(home.join(".nixsand"))
 }
 
-/// Validate that we're running on macOS aarch64.
-pub fn check_platform() -> Result<()> {
-    let os = std::env::consts::OS;
-    let arch = std::env::consts::ARCH;
-    if os != "macos" || arch != "aarch64" {
-        bail!(
-            "nixsand requires macOS on Apple Silicon (aarch64), but detected {os} {arch}"
-        );
-    }
-    Ok(())
-}
-
 /// Validate that all required host binaries are available.
 pub fn check_host_deps() -> Result<()> {
-    check_binary("container").context("'container' (Apple's container CLI) is required")?;
-    check_binary("tmux").context("'tmux' is required")?;
     check_binary("git").context("'git' is required")?;
+    check_binary("tmux").context("'tmux' is required")?;
     Ok(())
 }

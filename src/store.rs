@@ -5,6 +5,16 @@ pub struct Store {
     conn: Connection,
 }
 
+/// A registered task: a worktree + its tmux window + the agent launched in it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskRow {
+    pub project: String,
+    pub branch: String,
+    pub sanitized: String,
+    pub window: String,
+    pub agent: String,
+}
+
 impl Store {
     /// Open a store backed by a file on disk.
     pub fn open(path: &std::path::Path) -> Result<Self> {
@@ -31,23 +41,41 @@ impl Store {
             .execute_batch("PRAGMA journal_mode=WAL;")
             .context("failed to set WAL mode")?;
 
+        // `branches` is the task registry: one row per worktree, recording the
+        // tmux window and the agent command launched in it.
         self.conn
             .execute_batch(
                 "
                 CREATE TABLE IF NOT EXISTS projects (
                     name TEXT PRIMARY KEY,
-                    git_url TEXT NOT NULL,
-                    flake_lock_hash TEXT
+                    git_url TEXT NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS branches (
                     project TEXT NOT NULL REFERENCES projects(name),
                     branch TEXT NOT NULL,
                     sanitized TEXT NOT NULL,
+                    window TEXT NOT NULL DEFAULT '',
+                    agent TEXT NOT NULL DEFAULT '',
                     PRIMARY KEY (project, branch)
                 );
                 ",
             )
             .context("failed to initialize schema")?;
+
+        // Migrate older DBs (pre-orchestration schema) that lack window/agent.
+        // `ALTER TABLE ADD COLUMN` errors with "duplicate column" if present —
+        // tolerate that so init stays idempotent.
+        for stmt in [
+            "ALTER TABLE branches ADD COLUMN window TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE branches ADD COLUMN agent TEXT NOT NULL DEFAULT ''",
+        ] {
+            if let Err(e) = self.conn.execute(stmt, []) {
+                let msg = e.to_string();
+                if !msg.contains("duplicate column") {
+                    return Err(e).context("failed to migrate branches table");
+                }
+            }
+        }
 
         Ok(())
     }
@@ -98,71 +126,94 @@ impl Store {
         Ok(count > 0)
     }
 
-    /// Add a branch registration.
-    pub fn add_branch(&self, project: &str, branch: &str, sanitized: &str) -> Result<()> {
+    /// Remove a project from the registry.
+    #[allow(dead_code)]
+    pub fn remove_project(&self, name: &str) -> Result<()> {
         self.conn
-            .execute(
-                "INSERT OR REPLACE INTO branches (project, branch, sanitized) VALUES (?1, ?2, ?3)",
-                params![project, branch, sanitized],
-            )
-            .with_context(|| format!("failed to add branch '{branch}' for project '{project}'"))?;
+            .execute("DELETE FROM branches WHERE project = ?1", params![name])
+            .with_context(|| format!("failed to remove tasks for project '{name}'"))?;
+        self.conn
+            .execute("DELETE FROM projects WHERE name = ?1", params![name])
+            .with_context(|| format!("failed to remove project '{name}'"))?;
         Ok(())
     }
 
-    /// Look up a branch registration. Returns sanitized branch name if found.
-    pub fn lookup_branch(&self, project: &str, branch: &str) -> Result<Option<String>> {
+    /// Register (or update) a task: a worktree + its tmux window + agent.
+    pub fn register_task(
+        &self,
+        project: &str,
+        branch: &str,
+        sanitized: &str,
+        window: &str,
+        agent: &str,
+    ) -> Result<()> {
+        self.conn
+            .execute(
+                "INSERT OR REPLACE INTO branches (project, branch, sanitized, window, agent)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![project, branch, sanitized, window, agent],
+            )
+            .with_context(|| format!("failed to register task '{project}/{branch}'"))?;
+        Ok(())
+    }
+
+    /// Look up a single task by project + branch.
+    pub fn lookup_task(&self, project: &str, branch: &str) -> Result<Option<TaskRow>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT sanitized FROM branches WHERE project = ?1 AND branch = ?2")
-            .context("failed to prepare branch lookup")?;
+            .prepare(
+                "SELECT project, branch, sanitized, window, agent
+                 FROM branches WHERE project = ?1 AND branch = ?2",
+            )
+            .context("failed to prepare task lookup")?;
         let mut rows = stmt
-            .query_map(params![project, branch], |row| row.get(0))
-            .context("failed to query branch")?;
+            .query_map(params![project, branch], row_to_task)
+            .context("failed to query task")?;
         match rows.next() {
-            Some(row) => Ok(Some(row.context("failed to read branch row")?)),
+            Some(row) => Ok(Some(row.context("failed to read task row")?)),
             None => Ok(None),
         }
     }
 
-    /// Remove a branch registration.
-    #[allow(dead_code)]
-    pub fn remove_branch(&self, project: &str, branch: &str) -> Result<()> {
+    /// List all registered tasks, ordered by project then branch.
+    pub fn list_tasks(&self) -> Result<Vec<TaskRow>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT project, branch, sanitized, window, agent
+                 FROM branches ORDER BY project, branch",
+            )
+            .context("failed to prepare task list")?;
+        let rows = stmt
+            .query_map([], row_to_task)
+            .context("failed to query tasks")?;
+        let mut result = Vec::new();
+        for row in rows {
+            result.push(row.context("failed to read task row")?);
+        }
+        Ok(result)
+    }
+
+    /// Remove a task registration.
+    pub fn remove_task(&self, project: &str, branch: &str) -> Result<()> {
         self.conn
             .execute(
                 "DELETE FROM branches WHERE project = ?1 AND branch = ?2",
                 params![project, branch],
             )
-            .with_context(|| {
-                format!("failed to remove branch '{branch}' for project '{project}'")
-            })?;
+            .with_context(|| format!("failed to remove task '{project}/{branch}'"))?;
         Ok(())
     }
+}
 
-    /// Record the flake.lock hash for a project.
-    pub fn set_flake_lock_hash(&self, project: &str, hash: &str) -> Result<()> {
-        self.conn
-            .execute(
-                "UPDATE projects SET flake_lock_hash = ?1 WHERE name = ?2",
-                params![hash, project],
-            )
-            .with_context(|| format!("failed to update flake.lock hash for project '{project}'"))?;
-        Ok(())
-    }
-
-    /// Get the recorded flake.lock hash for a project.
-    pub fn get_flake_lock_hash(&self, project: &str) -> Result<Option<String>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT flake_lock_hash FROM projects WHERE name = ?1")
-            .context("failed to prepare flake.lock hash query")?;
-        let mut rows = stmt
-            .query_map(params![project], |row| row.get(0))
-            .context("failed to query flake.lock hash")?;
-        match rows.next() {
-            Some(row) => Ok(row.context("failed to read flake.lock hash row")?),
-            None => Ok(None),
-        }
-    }
+fn row_to_task(row: &rusqlite::Row) -> rusqlite::Result<TaskRow> {
+    Ok(TaskRow {
+        project: row.get(0)?,
+        branch: row.get(1)?,
+        sanitized: row.get(2)?,
+        window: row.get(3)?,
+        agent: row.get(4)?,
+    })
 }
 
 #[cfg(test)]
@@ -193,42 +244,42 @@ mod tests {
     }
 
     #[test]
-    fn add_and_lookup_branch() {
+    fn register_and_lookup_task() {
         let s = store();
         s.add_project("myproject", "https://example.com/foo.git")
             .unwrap();
-        s.add_branch("myproject", "feature/foo", "feature-foo").unwrap();
-        let sanitized = s.lookup_branch("myproject", "feature/foo").unwrap();
-        assert_eq!(sanitized, Some("feature-foo".to_string()));
+        s.register_task(
+            "myproject",
+            "feature/foo",
+            "feature-foo",
+            "myproject-feature-foo",
+            "claude",
+        )
+        .unwrap();
+        let task = s.lookup_task("myproject", "feature/foo").unwrap().unwrap();
+        assert_eq!(task.sanitized, "feature-foo");
+        assert_eq!(task.window, "myproject-feature-foo");
+        assert_eq!(task.agent, "claude");
     }
 
     #[test]
-    fn lookup_nonexistent_branch_returns_none() {
+    fn lookup_nonexistent_task_returns_none() {
         let s = store();
         s.add_project("myproject", "https://example.com/foo.git")
             .unwrap();
-        let result = s.lookup_branch("myproject", "nonexistent").unwrap();
-        assert!(result.is_none());
+        assert!(s.lookup_task("myproject", "nope").unwrap().is_none());
     }
 
     #[test]
-    fn flake_lock_hash_roundtrip() {
+    fn list_and_remove_tasks() {
         let s = store();
-        s.add_project("myproject", "https://example.com/foo.git")
-            .unwrap();
-        // Initially None
-        assert_eq!(s.get_flake_lock_hash("myproject").unwrap(), None);
-        // Set and retrieve
-        s.set_flake_lock_hash("myproject", "abc123").unwrap();
-        assert_eq!(
-            s.get_flake_lock_hash("myproject").unwrap(),
-            Some("abc123".to_string())
-        );
-        // Update
-        s.set_flake_lock_hash("myproject", "def456").unwrap();
-        assert_eq!(
-            s.get_flake_lock_hash("myproject").unwrap(),
-            Some("def456".to_string())
-        );
+        s.add_project("p", "https://example.com/p.git").unwrap();
+        s.register_task("p", "a", "a", "p-a", "claude").unwrap();
+        s.register_task("p", "b", "b", "p-b", "codex").unwrap();
+        assert_eq!(s.list_tasks().unwrap().len(), 2);
+        s.remove_task("p", "a").unwrap();
+        let tasks = s.list_tasks().unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].branch, "b");
     }
 }

@@ -3,141 +3,7 @@ use std::process::Command;
 
 use anyhow::{bail, Context, Result};
 
-use super::{ContainerBackend, GitBackend, Mount, ZmxBackend};
-
-// ---------------------------------------------------------------------------
-// ContainerBackend — wraps Apple's `container` CLI
-// ---------------------------------------------------------------------------
-
-pub struct RealContainerBackend;
-
-impl ContainerBackend for RealContainerBackend {
-    fn image_exists(&self, tag: &str) -> Result<bool> {
-        let output = Command::new("container")
-            .args(["image", "inspect", tag])
-            .output()
-            .context("failed to run 'container image inspect'")?;
-        Ok(output.status.success())
-    }
-
-    fn build_image(&self, tag: &str, context_dir: &Path) -> Result<()> {
-        let status = Command::new("container")
-            .args(["build", "-t", tag])
-            .arg(context_dir)
-            .status()
-            .context("failed to run 'container build'")?;
-        if !status.success() {
-            bail!("container build failed for image '{tag}'");
-        }
-        Ok(())
-    }
-
-    fn container_exists(&self, name: &str) -> Result<bool> {
-        // Apple's `container inspect` returns [] with exit 0 for missing containers;
-        // use `container list --all` instead.
-        let output = Command::new("container")
-            .args(["list", "--all"])
-            .output()
-            .context("failed to run 'container list --all'")?;
-        if !output.status.success() {
-            return Ok(false);
-        }
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        Ok(stdout.contains(name))
-    }
-
-    fn container_running(&self, name: &str) -> Result<bool> {
-        // `container list` (no --all) shows only running containers.
-        let output = Command::new("container")
-            .args(["list"])
-            .output()
-            .context("failed to run 'container list'")?;
-        if !output.status.success() {
-            return Ok(false);
-        }
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        Ok(stdout.contains(name))
-    }
-
-    fn create_container(
-        &self,
-        name: &str,
-        image: &str,
-        mounts: &[Mount],
-        entrypoint: &[&str],
-    ) -> Result<()> {
-        let mut cmd = Command::new("container");
-        cmd.args(["create", "--name", name]);
-        for mount in mounts {
-            cmd.arg("-v");
-            cmd.arg(format!("{}:{}", mount.host_path, mount.container_path));
-        }
-        for (i, part) in entrypoint.iter().enumerate() {
-            if i == 0 {
-                cmd.arg("--entrypoint").arg(part);
-            }
-        }
-        cmd.arg(image);
-        // Pass remaining entrypoint args after the image
-        if entrypoint.len() > 1 {
-            cmd.args(&entrypoint[1..]);
-        }
-
-        let status = cmd
-            .status()
-            .context("failed to run 'container create'")?;
-        if !status.success() {
-            bail!("container create failed for '{name}'");
-        }
-        Ok(())
-    }
-
-    fn start_container(&self, name: &str) -> Result<()> {
-        let output = Command::new("container")
-            .args(["start", name])
-            .output()
-            .context("failed to run 'container start'")?;
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            bail!("container start failed for '{}': {}", name, stderr.trim());
-        }
-        Ok(())
-    }
-
-    fn remove_container(&self, name: &str) -> Result<()> {
-        let status = Command::new("container")
-            .args(["rm", "-f", name])
-            .status()
-            .context("failed to run 'container rm'")?;
-        if !status.success() {
-            bail!("container rm failed for '{name}'");
-        }
-        Ok(())
-    }
-
-    fn exec_interactive(&self, name: &str, command: &str) -> Result<()> {
-        let status = Command::new("container")
-            .args(["exec", "-it", name, "sh", "-lc", command])
-            .status()
-            .context("failed to run 'container exec'")?;
-        if !status.success() {
-            bail!("container exec failed for '{name}'");
-        }
-        Ok(())
-    }
-
-    fn exec(&self, name: &str, command: &str) -> Result<()> {
-        let output = Command::new("container")
-            .args(["exec", name, "sh", "-c", command])
-            .output()
-            .context("failed to run 'container exec'")?;
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            bail!("container exec failed for '{}': {}", name, stderr.trim());
-        }
-        Ok(())
-    }
-}
+use super::{GitBackend, WindowInfo, ZmxBackend};
 
 // ---------------------------------------------------------------------------
 // GitBackend — wraps `git`
@@ -222,6 +88,27 @@ impl GitBackend for RealGitBackend {
         Ok(())
     }
 
+    fn remove_worktree(&self, bare_repo: &Path, worktree_path: &Path) -> Result<()> {
+        // `git worktree remove --force` drops the worktree and its admin files.
+        // Fall back to pruning if the directory is already gone.
+        let status = Command::new("git")
+            .args(["-C"])
+            .arg(bare_repo)
+            .args(["worktree", "remove", "--force"])
+            .arg(worktree_path)
+            .status()
+            .context("failed to run 'git worktree remove'")?;
+        if !status.success() {
+            // Best-effort: prune stale worktree metadata so the registry recovers.
+            let _ = Command::new("git")
+                .args(["-C"])
+                .arg(bare_repo)
+                .args(["worktree", "prune"])
+                .status();
+        }
+        Ok(())
+    }
+
     fn default_branch(&self, bare_repo: &Path) -> Result<String> {
         let output = Command::new("git")
             .args(["-C"])
@@ -256,20 +143,6 @@ impl GitBackend for RealGitBackend {
             Ok(branch)
         }
     }
-
-    fn read_file(&self, repo: &Path, path: &str) -> Result<Vec<u8>> {
-        let output = Command::new("git")
-            .args(["-C"])
-            .arg(repo)
-            .args(["show", &format!("HEAD:{path}")])
-            .output()
-            .context("failed to run 'git show'")?;
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            bail!("git show HEAD:{} failed: {}", path, stderr.trim());
-        }
-        Ok(output.stdout)
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -277,6 +150,11 @@ impl GitBackend for RealGitBackend {
 // ---------------------------------------------------------------------------
 
 pub struct RealZmxBackend;
+
+/// Build a `session:window` target string for tmux `-t` args.
+fn target(session: &str, window: &str) -> String {
+    format!("{session}:{window}")
+}
 
 impl ZmxBackend for RealZmxBackend {
     fn session_exists(&self, session: &str) -> Result<bool> {
@@ -287,9 +165,14 @@ impl ZmxBackend for RealZmxBackend {
         Ok(output.status.success())
     }
 
-    fn new_session(&self, session: &str, command: &str) -> Result<()> {
+    fn ensure_session(&self, session: &str) -> Result<()> {
+        if self.session_exists(session)? {
+            return Ok(());
+        }
+        // Create a detached session. The initial window is a throwaway shell;
+        // task windows are added with `new_window`.
         let status = Command::new("tmux")
-            .args(["new-session", "-d", "-s", session, command])
+            .args(["new-session", "-d", "-s", session, "-n", "nixsand"])
             .status()
             .context("failed to run 'tmux new-session'")?;
         if !status.success() {
@@ -298,7 +181,122 @@ impl ZmxBackend for RealZmxBackend {
         Ok(())
     }
 
-    fn attach_session(&self, session: &str) -> Result<()> {
+    fn new_window(&self, session: &str, window: &str, cwd: &Path, command: &str) -> Result<()> {
+        // Target the session with a trailing colon (`<session>:`) so tmux picks
+        // the next free window index. A bare `-t <session>` target instead
+        // tries to (re)use the session's base index, which fails with
+        // "index N in use" under `base-index`/`renumber-windows` configs.
+        let target = format!("{session}:");
+        let mut cmd = Command::new("tmux");
+        cmd.args(["new-window", "-t", &target, "-n", window, "-c"])
+            .arg(cwd)
+            // `--` terminates option parsing; the command runs via the user's shell.
+            .args(["--", "sh", "-lc", command]);
+        let status = cmd
+            .status()
+            .context("failed to run 'tmux new-window'")?;
+        if !status.success() {
+            bail!("tmux new-window failed for '{session}:{window}'");
+        }
+        Ok(())
+    }
+
+    fn window_exists(&self, session: &str, window: &str) -> Result<bool> {
+        Ok(self.list_windows(session)?.iter().any(|w| w.name == window))
+    }
+
+    fn send_keys(&self, session: &str, window: &str, text: &str) -> Result<()> {
+        let tgt = target(session, window);
+        // Send the literal text (`-l`), then Enter as a separate key event.
+        let status = Command::new("tmux")
+            .args(["send-keys", "-t", &tgt, "-l", "--", text])
+            .status()
+            .context("failed to run 'tmux send-keys'")?;
+        if !status.success() {
+            bail!("tmux send-keys failed for '{tgt}'");
+        }
+        let status = Command::new("tmux")
+            .args(["send-keys", "-t", &tgt, "Enter"])
+            .status()
+            .context("failed to run 'tmux send-keys Enter'")?;
+        if !status.success() {
+            bail!("tmux send-keys Enter failed for '{tgt}'");
+        }
+        Ok(())
+    }
+
+    fn capture_pane(&self, session: &str, window: &str, lines: Option<usize>) -> Result<String> {
+        let tgt = target(session, window);
+        let mut cmd = Command::new("tmux");
+        cmd.args(["capture-pane", "-p", "-t", &tgt]);
+        let start;
+        if let Some(n) = lines {
+            // `-S -N` starts the capture N lines above the visible bottom.
+            start = format!("-{n}");
+            cmd.args(["-S", &start]);
+        }
+        let output = cmd.output().context("failed to run 'tmux capture-pane'")?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            bail!("tmux capture-pane failed for '{}': {}", tgt, stderr.trim());
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    }
+
+    fn list_windows(&self, session: &str) -> Result<Vec<WindowInfo>> {
+        let output = Command::new("tmux")
+            .args([
+                "list-windows",
+                "-t",
+                session,
+                "-F",
+                "#{window_name}\t#{window_active}\t#{pane_dead}",
+            ])
+            .output()
+            .context("failed to run 'tmux list-windows'")?;
+        if !output.status.success() {
+            // No session / no windows → empty list.
+            return Ok(Vec::new());
+        }
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let mut windows = Vec::new();
+        for line in stdout.lines() {
+            let mut parts = line.split('\t');
+            let name = parts.next().unwrap_or_default().to_string();
+            if name.is_empty() {
+                continue;
+            }
+            let active = parts.next() == Some("1");
+            let dead = parts.next() == Some("1");
+            windows.push(WindowInfo { name, active, dead });
+        }
+        Ok(windows)
+    }
+
+    fn kill_window(&self, session: &str, window: &str) -> Result<()> {
+        let tgt = target(session, window);
+        let output = Command::new("tmux")
+            .args(["kill-window", "-t", &tgt])
+            .output()
+            .context("failed to run 'tmux kill-window'")?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            // A window that's already gone is not an error for teardown.
+            if stderr.contains("can't find window") || stderr.contains("no such window") {
+                return Ok(());
+            }
+            bail!("tmux kill-window failed for '{}': {}", tgt, stderr.trim());
+        }
+        Ok(())
+    }
+
+    fn attach(&self, session: &str, window: Option<&str>) -> Result<()> {
+        if let Some(w) = window {
+            // Best-effort: select the task's window before attaching.
+            let _ = Command::new("tmux")
+                .args(["select-window", "-t", &target(session, w)])
+                .status();
+        }
         let status = Command::new("tmux")
             .args(["attach-session", "-t", session])
             .status()

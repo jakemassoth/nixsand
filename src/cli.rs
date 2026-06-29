@@ -1,7 +1,10 @@
 use clap::{Args, Parser, Subcommand};
 
 #[derive(Parser, Debug)]
-#[command(name = "nixsand", about = "Manage isolated coding agent sandboxes")]
+#[command(
+    name = "nixsand",
+    about = "Orchestrate coding agents across git worktrees via tmux"
+)]
 pub struct Cli {
     /// Increase verbosity (-v for debug, -vv for trace)
     #[arg(short, long, action = clap::ArgAction::Count, global = true)]
@@ -13,11 +16,72 @@ pub struct Cli {
 
 #[derive(Subcommand, Debug)]
 pub enum Commands {
-    /// Initialize nixsand home directory and validate dependencies
+    /// Initialize the nixsand home directory and validate dependencies
     Init,
 
-    /// Manage projects
+    /// Manage projects (add / list)
     Project(ProjectArgs),
+
+    /// Create a worktree and launch an agent in a tmux window
+    Spawn {
+        /// Project name
+        project: String,
+        /// Branch name (created from base if it doesn't exist)
+        branch: String,
+        /// Base branch or commit (defaults to the project's default branch)
+        #[arg(long)]
+        base: Option<String>,
+        /// Agent command to launch in the window
+        #[arg(long, default_value = "claude")]
+        agent: String,
+        /// Initial prompt passed as the agent's trailing argument
+        #[arg(short, long)]
+        prompt: Option<String>,
+    },
+
+    /// Send a one-line instruction to a running agent
+    Send {
+        /// Project name
+        project: String,
+        /// Branch name
+        branch: String,
+        /// The instruction (remaining args are joined with spaces)
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
+        text: Vec<String>,
+    },
+
+    /// Print the recent output of an agent's pane
+    Peek {
+        /// Project name
+        project: String,
+        /// Branch name
+        branch: String,
+        /// Number of pane lines to show
+        #[arg(short = 'n', long)]
+        lines: Option<usize>,
+    },
+
+    /// List all tasks and whether their agents are still running
+    Status,
+
+    /// Attach to the nixsand tmux session to watch the crew
+    Attach {
+        /// Optional project to select a specific task window
+        project: Option<String>,
+        /// Optional branch to select a specific task window
+        branch: Option<String>,
+    },
+
+    /// Stop an agent's window (optionally removing its worktree)
+    Kill {
+        /// Project name
+        project: String,
+        /// Branch name
+        branch: String,
+        /// Also remove the git worktree from disk
+        #[arg(long)]
+        rm_worktree: bool,
+    },
 }
 
 #[derive(Args, Debug)]
@@ -38,22 +102,4 @@ pub enum ProjectCommands {
 
     /// List all registered projects
     List,
-
-    /// Provision a worktree and container for a branch
-    Branch {
-        /// Project name
-        project: String,
-        /// Branch name
-        branch: String,
-        /// Base branch or commit (defaults to default branch)
-        base: Option<String>,
-    },
-
-    /// Attach to a branch's tmux session
-    Attach {
-        /// Project name
-        project: String,
-        /// Branch name
-        branch: String,
-    },
 }

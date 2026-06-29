@@ -3,7 +3,6 @@ mod cli;
 mod commands;
 mod config;
 mod guard;
-mod image;
 mod names;
 mod store;
 
@@ -12,6 +11,7 @@ use clap::Parser;
 
 use cli::{Cli, Commands, ProjectCommands};
 use config::Config;
+use commands::{orchestrate, project};
 
 fn main() {
     let cli = Cli::parse();
@@ -31,34 +31,57 @@ fn main() {
 
 fn run(cli: Cli) -> Result<()> {
     match cli.command {
-        Commands::Init => {
-            commands::init::run_init()?;
-        }
+        Commands::Init => return commands::init::run_init(),
         Commands::Project(project_args) => {
-            // Most project commands need a full config
+            let config = Config::load()?;
             match project_args.command {
                 ProjectCommands::Add { git_url, name } => {
-                    let config = Config::load()?;
-                    commands::project::run_add(&config, &git_url, name.as_deref())?;
+                    project::run_add(&config, &git_url, name.as_deref())?;
                 }
-                ProjectCommands::List => {
-                    let config = Config::load()?;
-                    commands::project::run_list(&config)?;
-                }
-                ProjectCommands::Branch {
-                    project,
-                    branch,
-                    base,
-                } => {
-                    let config = Config::load()?;
-                    commands::project::run_branch(&config, &project, &branch, base.as_deref())?;
-                }
-                ProjectCommands::Attach { project, branch } => {
-                    let config = Config::load()?;
-                    commands::project::run_attach(&config, &project, &branch)?;
-                }
+                ProjectCommands::List => project::run_list(&config)?,
             }
+            return Ok(());
         }
+        _ => {}
+    }
+
+    // Orchestration commands all need a loaded config.
+    let config = Config::load()?;
+    match cli.command {
+        Commands::Spawn {
+            project,
+            branch,
+            base,
+            agent,
+            prompt,
+        } => orchestrate::run_spawn(
+            &config,
+            &project,
+            &branch,
+            base.as_deref(),
+            &agent,
+            prompt.as_deref(),
+        )?,
+        Commands::Send {
+            project,
+            branch,
+            text,
+        } => orchestrate::run_send(&config, &project, &branch, &text.join(" "))?,
+        Commands::Peek {
+            project,
+            branch,
+            lines,
+        } => orchestrate::run_peek(&config, &project, &branch, lines)?,
+        Commands::Status => orchestrate::run_status(&config)?,
+        Commands::Attach { project, branch } => {
+            orchestrate::run_attach(&config, project.as_deref(), branch.as_deref())?;
+        }
+        Commands::Kill {
+            project,
+            branch,
+            rm_worktree,
+        } => orchestrate::run_kill(&config, &project, &branch, rm_worktree)?,
+        Commands::Init | Commands::Project(_) => unreachable!("handled above"),
     }
     Ok(())
 }
