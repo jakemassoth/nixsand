@@ -87,14 +87,19 @@
           program = toString (
             pkgs.writeShellScript "yeschef-e2e" ''
               set -euo pipefail
-              export PATH="${zmx}/bin:$PATH"
+              # Prepend the pinned toolchain so BOTH cargo and the `rustc` it
+              # shells out to come from nix. Without rustToolchain on PATH, cargo
+              # resolves `rustc` to whatever is on PATH — on a clean CI runner
+              # that is a rustup shim, which tries to auto-install a toolchain and
+              # corrupts itself under concurrent build scripts.
+              export PATH="${rustToolchain}/bin:${zmx}/bin:$PATH"
               for bin in git zmx; do
                 if ! command -v "$bin" >/dev/null 2>&1; then
                   echo "error: '$bin' not found in PATH; e2e tests require it" >&2
                   exit 1
                 fi
               done
-              exec ${rustToolchain}/bin/cargo test --test e2e -- --ignored --test-threads=1 "$@"
+              exec cargo test --test e2e -- --ignored --test-threads=1 "$@"
             ''
           );
         };
