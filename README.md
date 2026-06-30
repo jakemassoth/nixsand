@@ -36,6 +36,15 @@ yeschef kill  <project> <branch> --rm-worktree
 `spawn --agent <cmd>` chooses the harness (default `claude`); `-p/--prompt` is passed as
 the agent's first argument.
 
+The examples above use the bare `yeschef` form (an installed binary on `PATH`). If instead
+you run from a source checkout — the canonical one lives at **`~/.yeschef/yeschef-src`** —
+point `nix run` at that path so it works from any directory and always runs the latest
+source there:
+
+```bash
+nix run ~/.yeschef/yeschef-src -- <args>    # e.g. ... -- spawn <project> <branch> -p "..."
+```
+
 Run your head chef agent from `~/.yeschef` so it loads `AGENTS.md` — the manual that
 describes the dispatch → supervise → land → teardown loop.
 

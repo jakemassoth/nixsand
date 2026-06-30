@@ -24,20 +24,21 @@ moving.
 ## Invoking yeschef
 
 Everywhere below the command is written as `yeschef`. How you actually run it depends on
-where you were launched:
+your setup:
 
-- **From a yeschef source checkout** (a git branch of yeschef itself — the usual setup):
-  use **this branch's** build so your edits take effect immediately. Run, from the repo
-  root:
+- **From the fixed source checkout** (the usual setup): the canonical yeschef source lives
+  at **`~/.yeschef/yeschef-src`**. Point `nix run` at that path and it works **from any
+  directory**, always running the latest source there — no `cd` to a repo root needed:
 
   ```
-  nix run . -- <args>          # e.g. nix run . -- spawn <project> <branch> -p "..."
+  nix run ~/.yeschef/yeschef-src -- <args>    # works from anywhere
+  # e.g. nix run ~/.yeschef/yeschef-src -- spawn <project> <branch> -p "..."
   ```
 
-  (`cargo run -- <args>` rebuilds faster for tight loops; `nix run .` is the reproducible
-  default.)
-- **From an installed yeschef** (on `PATH`, e.g. when launched from `~/.yeschef`): just
-  run `yeschef <args>`.
+  Edits to `~/.yeschef/yeschef-src` take effect on the next invocation. For tight loops,
+  `cargo run --manifest-path ~/.yeschef/yeschef-src/Cargo.toml -- <args>` rebuilds faster
+  (also runnable from anywhere); `nix run` is the reproducible default.
+- **From an installed yeschef** (on `PATH`): just run `yeschef <args>`.
 
 Pick one and use it consistently. The examples below use the bare `yeschef` form.
 
