@@ -3,7 +3,7 @@ use std::process::Command;
 
 use anyhow::{bail, Context, Result};
 
-use super::{GitBackend, WindowInfo, ZmxBackend};
+use super::{BranchStatus, GitBackend, WindowInfo, ZmxBackend};
 
 // ---------------------------------------------------------------------------
 // GitBackend — wraps `git`
@@ -128,7 +128,29 @@ impl GitBackend for RealGitBackend {
         Ok(())
     }
 
+    fn delete_branch(&self, bare_repo: &Path, branch: &str) -> Result<()> {
+        // `git branch -D` force-deletes the local branch. The worktree is
+        // removed before this runs, so the branch isn't checked out anywhere.
+        let output = Command::new("git")
+            .args(["-C"])
+            .arg(bare_repo)
+            .args(["branch", "-D", branch])
+            .output()
+            .context("failed to run 'git branch -D'")?;
+        if output.status.success() {
+            return Ok(());
+        }
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        // A branch that's already gone is not an error for teardown.
+        if stderr.contains("not found") {
+            return Ok(());
+        }
+        bail!("git branch -D {} failed: {}", branch, stderr.trim());
+    }
+
     fn fetch_prune(&self, bare_repo: &Path) -> Result<()> {
+        // Callers run `ensure_tracking_refspec` first, so the fetch refspec is
+        // configured and `--prune` maintains `refs/remotes/origin/*`.
         let status = Command::new("git")
             .args(["-C"])
             .arg(bare_repo)
@@ -139,6 +161,45 @@ impl GitBackend for RealGitBackend {
             bail!("git fetch --prune origin failed");
         }
         Ok(())
+    }
+
+    fn branch_status(
+        &self,
+        bare_repo: &Path,
+        branch: &str,
+        main_ref: &str,
+    ) -> Result<BranchStatus> {
+        // Merged: the branch tip is an ancestor of the main line, so its work
+        // is already in `main`. This is the definitive safe-to-reap signal.
+        let merged = Command::new("git")
+            .args(["-C"])
+            .arg(bare_repo)
+            .args(["merge-base", "--is-ancestor", branch, main_ref])
+            .status()
+            .is_ok_and(|s| s.success());
+        if merged {
+            return Ok(BranchStatus::Merged);
+        }
+
+        // Gone: the configured upstream was deleted on the remote (surfaced by
+        // `fetch --prune`). `%(upstream:track)` reports `[gone]` in that case.
+        // This catches squash/rebase merges, whose tips never become ancestors
+        // of `main` but whose branch was cleaned up after the PR landed.
+        let output = Command::new("git")
+            .args(["-C"])
+            .arg(bare_repo)
+            .args([
+                "for-each-ref",
+                "--format=%(upstream:track)",
+                &format!("refs/heads/{branch}"),
+            ])
+            .output()
+            .context("failed to run 'git for-each-ref'")?;
+        if String::from_utf8_lossy(&output.stdout).contains("[gone]") {
+            return Ok(BranchStatus::Gone);
+        }
+
+        Ok(BranchStatus::Unmerged)
     }
 
     fn default_branch(&self, bare_repo: &Path) -> Result<String> {

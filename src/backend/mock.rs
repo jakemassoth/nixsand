@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
 
-use super::{GitBackend, WindowInfo, ZmxBackend};
+use super::{BranchStatus, GitBackend, WindowInfo, ZmxBackend};
 
 // ---------------------------------------------------------------------------
 // Recording mock for GitBackend
@@ -16,6 +16,9 @@ use super::{GitBackend, WindowInfo, ZmxBackend};
 pub struct MockGitBackend {
     pub calls: Arc<Mutex<Vec<String>>>,
     pub default_branch_response: Arc<Mutex<String>>,
+    /// Canned `branch_status` responses keyed by branch name. Branches with no
+    /// entry classify as `Unmerged` (the safe default — keep).
+    pub branch_statuses: Arc<Mutex<HashMap<String, BranchStatus>>>,
 }
 
 impl MockGitBackend {
@@ -27,6 +30,15 @@ impl MockGitBackend {
 
     pub fn recorded_calls(&self) -> Vec<String> {
         self.calls.lock().unwrap().clone()
+    }
+
+    /// Pre-seed the classification a given branch reports from `branch_status`.
+    pub fn with_branch_status(self, branch: &str, status: BranchStatus) -> Self {
+        self.branch_statuses
+            .lock()
+            .unwrap()
+            .insert(branch.to_string(), status);
+        self
     }
 
     fn record(&self, call: String) {
@@ -76,6 +88,11 @@ impl GitBackend for MockGitBackend {
         Ok(())
     }
 
+    fn delete_branch(&self, bare_repo: &Path, branch: &str) -> Result<()> {
+        self.record(format!("delete_branch:{}:{}", bare_repo.display(), branch));
+        Ok(())
+    }
+
     fn default_branch(&self, bare_repo: &Path) -> Result<String> {
         self.record(format!("default_branch:{}", bare_repo.display()));
         Ok(self.default_branch_response.lock().unwrap().clone())
@@ -89,6 +106,27 @@ impl GitBackend for MockGitBackend {
     fn fetch_prune(&self, bare_repo: &Path) -> Result<()> {
         self.record(format!("fetch_prune:{}", bare_repo.display()));
         Ok(())
+    }
+
+    fn branch_status(
+        &self,
+        bare_repo: &Path,
+        branch: &str,
+        main_ref: &str,
+    ) -> Result<BranchStatus> {
+        self.record(format!(
+            "branch_status:{}:{}:{}",
+            bare_repo.display(),
+            branch,
+            main_ref
+        ));
+        Ok(self
+            .branch_statuses
+            .lock()
+            .unwrap()
+            .get(branch)
+            .copied()
+            .unwrap_or(BranchStatus::Unmerged))
     }
 }
 
