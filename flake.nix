@@ -159,6 +159,10 @@
             rustToolchain
             pkgs.cargo-watch
             zmx
+            # vhs records the terminal headlessly so line cooks can attach
+            # demo recordings to PRs. The nixpkgs derivation wraps its
+            # `ttyd` + `ffmpeg` runtime deps, so the binary is self-contained.
+            pkgs.vhs
           ];
 
           RUST_SRC_PATH = "${rustToolchain}/lib/rustlib/src/rust/library";

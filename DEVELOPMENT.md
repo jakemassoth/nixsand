@@ -90,6 +90,15 @@ actually exercise it:
   are the only thing that exercises real `zmx`/`git` behavior.
 - Touching a single e2e test → run that specific test, not the whole suite.
 
+## Recording the terminal (demos / repros)
+
+The dev shell ships `vhs` (charmbracelet/vhs) so you can record a terminal
+session headlessly and attach a gif/mp4 to a PR. The `terminal-recording` skill
+(`.claude/skills/terminal-recording/SKILL.md`) is the quick-reference. A worked
+example lives in `docs/tui-demo.tape` (records `yeschef tui` →
+`docs/tui-demo.gif`); regenerate it with `nix develop --command vhs
+docs/tui-demo.tape`.
+
 ## Architecture
 
 External I/O is behind two traits in `src/backend/mod.rs`:
