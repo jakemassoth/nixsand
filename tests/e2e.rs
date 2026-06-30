@@ -556,6 +556,102 @@ fn kill_removes_window_and_deregisters() {
         .stdout(predicate::str::contains(format!("{name}/demo")).not());
 }
 
+// ---------------------------------------------------------------------------
+// cleanup
+// ---------------------------------------------------------------------------
+
+#[test]
+#[ignore = "requires git + zmx"]
+fn cleanup_dry_run_reports_without_removing() {
+    let env = TestEnv::new();
+    env.init();
+    let repo = SampleRepo::new();
+    let name = unique_name();
+    env.cmd()
+        .args(["project", "add", &repo.url(), &name])
+        .assert()
+        .success();
+
+    let window = format!("{name}-demo");
+    let _cleanup = WindowCleanup(vec![window.clone()]);
+
+    // A branch spawned from `main` points at main's tip, so it is an ancestor
+    // of origin/main — classified "merged" and thus a reap candidate.
+    env.cmd()
+        .args(["spawn", &name, "demo", "--agent", "sh -c 'sleep 30'"])
+        .assert()
+        .success();
+    assert!(window_exists(&window), "window should exist after spawn");
+
+    // Default cleanup (no --yes) is a dry run: it reports the candidate but
+    // removes nothing.
+    env.cmd()
+        .args(["cleanup", &name])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("would reap"))
+        .stdout(predicate::str::contains(format!("{name}/demo")));
+
+    // The window, worktree, and registry entry all survive the dry run.
+    assert!(window_exists(&window), "dry run must not kill the window");
+    let worktree = env
+        .home_path()
+        .join("projects")
+        .join(&name)
+        .join("worktrees")
+        .join("demo");
+    assert!(worktree.is_dir(), "dry run must not remove the worktree");
+    env.cmd()
+        .args(["status"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(format!("{name}/demo")));
+}
+
+#[test]
+#[ignore = "requires git + zmx"]
+fn cleanup_yes_reaps_merged_ticket() {
+    let env = TestEnv::new();
+    env.init();
+    let repo = SampleRepo::new();
+    let name = unique_name();
+    env.cmd()
+        .args(["project", "add", &repo.url(), &name])
+        .assert()
+        .success();
+
+    let window = format!("{name}-demo");
+    let _cleanup = WindowCleanup(vec![window.clone()]);
+
+    env.cmd()
+        .args(["spawn", &name, "demo", "--agent", "sh -c 'sleep 30'"])
+        .assert()
+        .success();
+    assert!(window_exists(&window), "window should exist after spawn");
+
+    env.cmd()
+        .args(["cleanup", &name, "--yes"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("reaped"))
+        .stdout(predicate::str::contains(format!("{name}/demo")));
+
+    // Session, worktree, and registry entry are all gone.
+    assert!(!window_exists(&window), "window should be killed by cleanup");
+    let worktree = env
+        .home_path()
+        .join("projects")
+        .join(&name)
+        .join("worktrees")
+        .join("demo");
+    assert!(!worktree.exists(), "worktree should be removed by cleanup");
+    env.cmd()
+        .args(["status"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(format!("{name}/demo")).not());
+}
+
 #[test]
 #[ignore = "requires git + zmx"]
 fn spawn_duplicate_window_rejected() {

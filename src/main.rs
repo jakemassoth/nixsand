@@ -10,7 +10,7 @@ use anyhow::Result;
 use clap::Parser;
 
 use cli::{Cli, Commands, ProjectCommands};
-use commands::{orchestrate, project, tui};
+use commands::{cleanup, orchestrate, project, tui};
 use config::Config;
 
 fn main() {
@@ -87,6 +87,9 @@ fn run(cli: Cli) -> Result<()> {
             branch,
             rm_worktree,
         } => orchestrate::run_kill(&config, &project, &branch, rm_worktree)?,
+        Commands::Cleanup { project, yes } => {
+            cleanup::run_cleanup(&config, project.as_deref(), yes)?;
+        }
         Commands::Init | Commands::Project(_) | Commands::Refresh { .. } => {
             unreachable!("handled above")
         }

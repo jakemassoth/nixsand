@@ -91,6 +91,16 @@ pub enum Commands {
         #[arg(long)]
         rm_worktree: bool,
     },
+
+    /// Reap stale tickets whose branches are merged or gone from the remote
+    Cleanup {
+        /// Project to clean (omit to clean every registered project)
+        project: Option<String>,
+        /// Actually reap the candidates; without this it's a dry run that only
+        /// reports what would be removed
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 #[derive(Args, Debug)]

@@ -4,6 +4,20 @@ use std::path::Path;
 pub mod mock;
 pub mod real;
 
+/// How a ticket branch relates to the project's main line — drives whether
+/// `cleanup` may safely reap it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BranchStatus {
+    /// Tip is an ancestor of the main line: the work is in `main`. Safe to reap.
+    Merged,
+    /// Upstream tracking branch was deleted on the remote (detected via
+    /// `fetch --prune`): the branch landed and was cleaned up. Safe to reap.
+    Gone,
+    /// Has commits not on the main line and a live (or unset) upstream: still
+    /// active / unmerged work. Keep it.
+    Unmerged,
+}
+
 /// Trait abstracting git operations.
 pub trait GitBackend: Send + Sync {
     fn clone_bare(&self, url: &str, dest: &Path) -> Result<()>;
@@ -19,6 +33,8 @@ pub trait GitBackend: Send + Sync {
     ) -> Result<()>;
     /// Remove a worktree registration (and prune stale metadata).
     fn remove_worktree(&self, bare_repo: &Path, worktree_path: &Path) -> Result<()>;
+    /// Delete a local branch from the repo (force). Succeeds if already absent.
+    fn delete_branch(&self, bare_repo: &Path, branch: &str) -> Result<()>;
     fn default_branch(&self, bare_repo: &Path) -> Result<String>;
     /// Configure `origin` to fetch into remote-tracking refs
     /// (`+refs/heads/*:refs/remotes/origin/*`). A plain `git clone --bare`
@@ -29,6 +45,16 @@ pub trait GitBackend: Send + Sync {
     /// Fetch the latest refs from `origin` into the bare clone, pruning
     /// deleted remote branches.
     fn fetch_prune(&self, bare_repo: &Path) -> Result<()>;
+    /// Classify a ticket branch relative to the project's main line
+    /// (`main_ref`, e.g. `origin/main`) so `cleanup` can decide whether to
+    /// reap it. Must not mutate the repo. Run `fetch_prune` first so the
+    /// merged / gone determination reflects the latest remote state.
+    fn branch_status(
+        &self,
+        bare_repo: &Path,
+        branch: &str,
+        main_ref: &str,
+    ) -> Result<BranchStatus>;
 }
 
 /// Liveness/identity info for a single ticket window.
