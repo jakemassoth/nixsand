@@ -131,6 +131,14 @@ For each piece of work the human gives you:
   `yeschef send <project> <branch> "Read the ticket brief at ~/.yeschef/prompts/<project>-<branch>.md and carry it out start to finish."`
   (the prompt file is still there from `spawn`).
 
+## Recording the terminal for PRs
+
+Line cooks (and you) can record a terminal session **headlessly** with VHS to
+attach a demo to a PR or reproduce an issue — no human driving a live terminal.
+The `terminal-recording` skill (`.claude/skills/terminal-recording/SKILL.md`)
+teaches the `.tape` workflow end to end. When a ticket would benefit from a
+visual demo, tell the line cook to use that skill.
+
 ## Working on yeschef itself
 
 If your job is to **change yeschef's own source code** (not to orchestrate other agents),
